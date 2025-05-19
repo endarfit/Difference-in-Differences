@@ -1,4 +1,4 @@
-# Non-Parallel Trends in Canonical 2x2 DiD ??? Base Version
+# Non-Parallel Trends in Canonical 2x2 DiD Base Version
 
 # Load necessary packages
 library(fixest)
