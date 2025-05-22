@@ -29,7 +29,7 @@ panel <- panel %>%
          eps = rnorm(n()),
          Y = theta * D + beta * X + trend + eps)
 
-# ??? FUNCTION: Measure non-parallelness (reusable)
+# FUNCTION: Measure non-parallelness (reusable)
 measure_non_parallel <- function(data) {
   avg <- data %>%
     group_by(group, time) %>%
@@ -47,7 +47,7 @@ cat("Non-parallelness score:", round(np_score, 3), "\n")
 model <- feols(Y ~ D + X | id + time, data = panel)
 summary(model)
 
-# ??? Visualization of average trends
+# Visualization of average trends
 avg_Y <- panel %>%
   group_by(group, time) %>%
   summarise(mean_Y = mean(Y), .groups = "drop")
