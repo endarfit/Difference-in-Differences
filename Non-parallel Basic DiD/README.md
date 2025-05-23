@@ -86,6 +86,16 @@ Adding covariates pulls the estimate closer to 2, but doesn’t eliminate the bi
 
 The non-parallelness score remains the same, because it's a property of the data-generating trend, not the covariate.
 
+📈 Visual Output
+Produces a side-by-side faceted ggplot2 histogram:
+
+📌 Interpretation
+Without covariates: Bias is typically larger due to non-parallel trend violation.
+
+With covariates: Bias is reduced, but not eliminated (covariates help with omitted variable bias, not trend bias).
+
+This plot visually reinforces how modeling assumptions affect DiD estimates.
+
 🧰 Requirements
 R ≥ 4.0
 
