@@ -1,0 +1,74 @@
+# Ashenfelter's Dip (1978) and Relative Magnitude Bounds
+
+# Install packages if needed
+install.packages(c("dplyr", "ggplot2", "fixest", "remotes"))
+
+# Turn off warning-error-conversion
+Sys.setenv("R_REMOTES_NO_ERRORS_FROM_WARNINGS" = "true")
+remotes::install_github("asheshrambachan/HonestDiD")
+
+# Load libraries
+library(dplyr)
+library(ggplot2)
+library(fixest)
+library(HonestDiD)
+
+# Set seed for reproducibility
+set.seed(2025)
+
+# Parameters
+n <- 1000               # individuals
+time_periods <- -5:4    # periods from -5 to +4
+n_periods <- length(time_periods)
+
+# Create panel data
+df <- expand.grid(id = 1:n, time = time_periods)
+df <- df %>%
+  mutate(treated = ifelse(id <= n/2, 1, 0),
+         treatment_time = 0,
+         post = ifelse(time >= treatment_time & treated == 1, 1, 0),
+         event_time = time)
+
+# Simulate outcomes
+df <- df %>%
+  mutate(
+    # Baseline trend (slightly increasing)
+    base_trend = 0.5 * time,
+    
+    # Ashenfelter's dip for treated group at t = -1
+    dip = ifelse(treated == 1 & time == -1, -4, 0),
+    
+    # Treatment effect (after t >= 0 only for treated)
+    treatment_effect = ifelse(post == 1, 3, 0),
+    
+    # Outcome with individual noise
+    y = base_trend + dip + treatment_effect + rnorm(n * n_periods, 0, 1)
+  )
+
+# Plot average outcomes over time (group means)
+
+avg_outcome <- df %>%
+  group_by(time, treated) %>%
+  summarise(mean_y = mean(y), .groups = "drop")
+
+ggplot(avg_outcome, aes(x = time, y = mean_y, color = factor(treated))) +
+  geom_line(size = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(title = "Ashenfelter's Dip: Group Average Outcomes Over Time",
+       x = "Time (relative to treatment)",
+       y = "Average Outcome",
+       color = "Group") +
+  scale_color_manual(labels = c("Control", "Treated"), values = c("blue", "red")) +
+  theme_minimal(base_size = 14)
+
+# Estimate TWFE model with event-time dummies
+df$event_time <- as.factor(df$event_time)
+df <- df %>% filter(time != -1)  # optionally drop the dip to test sensitivity
+
+event_model <- feols(y ~ i(event_time, treated, ref = "-2") | id + time, data = df)
+
+iplot(event_model,
+      ref.line = 0,
+      xlab = "Event Time",
+      ylab = "Treatment Effect",
+      main = "Event Study: Ashenfelter's Dip Distorts Pre-Trends")
