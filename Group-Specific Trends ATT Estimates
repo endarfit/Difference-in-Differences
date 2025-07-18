@@ -1,0 +1,70 @@
+# Install and load required packages
+install.packages(c("fixest", "ggplot2"))
+library(fixest)
+library(ggplot2)
+
+# Set seed and parameters
+set.seed(2025)
+n <- 1000
+T_vec <- -5:4
+true_ATT <- 3
+n_sim <- 1000
+estimates <- numeric(n_sim)
+
+# Monte Carlo simulation
+for (s in 1:n_sim) {
+  df <- expand.grid(id = 1:n, time = T_vec)
+  df$treated <- ifelse(df$id <= n / 2, 1, 0)
+  df$post <- ifelse(df$time >= 0 & df$treated == 1, 1, 0)
+  df$trend <- ifelse(df$treated == 1, 0.6 * df$time, 0.4 * df$time)
+  df$treatment_effect <- ifelse(df$post == 1, true_ATT, 0)
+  df$eps <- rnorm(n * length(T_vec))
+  df$y <- df$trend + df$treatment_effect + df$eps
+  df <- df[df$time != -1, ]
+  df$event_time <- factor(df$time, levels = setdiff(T_vec, -1))
+  
+  model <- tryCatch(
+    feols(y ~ i(event_time, treated, ref = "-2") | id + time, data = df),
+    error = function(e) NULL
+  )
+  
+  if (!is.null(model)) {
+    coef_names <- names(coef(model))
+    t0 <- coef_names[grepl("treated", coef_names) & grepl("0", coef_names)]
+    estimates[s] <- if (length(t0) > 0) coef(model)[t0[1]] else NA
+  } else {
+    estimates[s] <- NA
+  }
+}
+
+# Clean estimates
+estimates_clean <- na.omit(estimates)
+if (length(estimates_clean) == 0) stop("All estimates are NA")
+
+# Summary stats
+mean_est <- mean(estimates_clean)
+bias <- mean_est - true_ATT
+rmse <- sqrt(mean((estimates_clean - true_ATT)^2))
+
+# Output to console
+cat("✅ Valid simulations:", length(estimates_clean), "/", n_sim, "\n")
+cat("True ATT:", true_ATT, "\n")
+cat("Mean Estimate:", round(mean_est, 3), "\n")
+cat("Bias:", round(bias, 3), "\n")
+cat("RMSE:", round(rmse, 3), "\n")
+
+# === ✅ Final histogram that appears in Viewer ===
+df_plot <- data.frame(att = estimates_clean)
+
+ggplot(df_plot, aes(x = att)) +
+  geom_histogram(bins = 40, fill = "skyblue", color = "black") +
+  geom_vline(xintercept = true_ATT, color = "red", linetype = "dashed", linewidth = 1.2) +
+  geom_vline(xintercept = mean_est, color = "darkgreen", linetype = "dotted", linewidth = 1.2) +
+  labs(
+    title = "Distribution of TWFE Estimates (Group-Specific Trends)",
+    subtitle = paste0("Bias = ", round(bias, 2), 
+                      ", RMSE = ", round(rmse, 2)),
+    x = "Estimated ATT at t = 0",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 14)
