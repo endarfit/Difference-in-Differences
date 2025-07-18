@@ -1,0 +1,151 @@
+# Install and load required packages
+install.packages(c("fixest", "ggplot2"))
+library(fixest)
+library(ggplot2)
+
+# Set seed and parameters
+set.seed(2025)
+n <- 1000
+T_vec <- -5:4
+true_ATT <- 3
+n_sim <- 1000
+estimates <- numeric(n_sim)
+
+# Monte Carlo simulation
+for (s in 1:n_sim) {
+  df <- expand.grid(id = 1:n, time = T_vec)
+  df$treated <- ifelse(df$id <= n / 2, 1, 0)
+  df$post <- ifelse(df$time >= 0 & df$treated == 1, 1, 0)
+  df$trend <- ifelse(df$treated == 1, 0.6 * df$time, 0.4 * df$time)
+  df$treatment_effect <- ifelse(df$post == 1, true_ATT, 0)
+  df$eps <- rnorm(n * length(T_vec))
+  df$y <- df$trend + df$treatment_effect + df$eps
+  df <- df[df$time != -1, ]
+  df$event_time <- factor(df$time, levels = setdiff(T_vec, -1))
+  
+  model <- tryCatch(
+    feols(y ~ i(event_time, treated, ref = "-2") | id + time, data = df),
+    error = function(e) NULL
+  )
+  
+  if (!is.null(model)) {
+    coef_names <- names(coef(model))
+    t0 <- coef_names[grepl("treated", coef_names) & grepl("0", coef_names)]
+    estimates[s] <- if (length(t0) > 0) coef(model)[t0[1]] else NA
+  } else {
+    estimates[s] <- NA
+  }
+}
+
+# Clean estimates
+estimates_clean <- na.omit(estimates)
+if (length(estimates_clean) == 0) stop("All estimates are NA")
+
+# Summary stats
+mean_est <- mean(estimates_clean)
+bias <- mean_est - true_ATT
+rmse <- sqrt(mean((estimates_clean - true_ATT)^2))
+
+# Output to console
+cat("✅ Valid simulations:", length(estimates_clean), "/", n_sim, "\n")
+cat("True ATT:", true_ATT, "\n")
+cat("Mean Estimate:", round(mean_est, 3), "\n")
+cat("Bias:", round(bias, 3), "\n")
+cat("RMSE:", round(rmse, 3), "\n")
+
+# === ✅ Final histogram that appears in Viewer ===
+df_plot <- data.frame(att = estimates_clean)
+
+ggplot(df_plot, aes(x = att)) +
+  geom_histogram(bins = 40, fill = "skyblue", color = "black") +
+  geom_vline(xintercept = true_ATT, color = "red", linetype = "dashed", linewidth = 1.2) +
+  geom_vline(xintercept = mean_est, color = "darkgreen", linetype = "dotted", linewidth = 1.2) +
+  labs(
+    title = "Distribution of TWFE Estimates (Group-Specific Trends)",
+    subtitle = paste0("Bias = ", round(bias, 2), 
+                      ", RMSE = ", round(rmse, 2)),
+    x = "Estimated ATT at t = 0",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 14)
+
+# Install and load HonestDiD if not installed
+if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
+remotes::install_github("asheshrambachan/HonestDiD")
+
+# Load HonestDiD
+library(HonestDiD)
+
+# 1. Simulate a single dataset (same DGP as before)
+set.seed(999)
+df <- expand.grid(id = 1:n, time = T_vec)
+df$treated <- ifelse(df$id <= n / 2, 1, 0)
+df$post <- ifelse(df$time >= 0 & df$treated == 1, 1, 0)
+df$trend <- ifelse(df$treated == 1, 0.6 * df$time, 0.4 * df$time)
+df$treatment_effect <- ifelse(df$post == 1, true_ATT, 0)
+df$eps <- rnorm(n * length(T_vec))
+df$y <- df$trend + df$treatment_effect + df$eps
+df <- df[df$time != -1, ]
+df$event_time <- factor(df$time, levels = setdiff(T_vec, -1))
+
+# 2. Estimate event-study model
+event_model <- feols(y ~ i(event_time, treated, ref = "-2") | id + time, data = df)
+
+# 3. Extract and parse coefficients
+event_coef <- coef(event_model)
+event_se <- se(event_model)
+
+# Use regex to extract the last number (event time) from coefficient names
+coef_names <- names(event_coef)
+event_times <- as.numeric(gsub(".*([\\-0-9]+)$", "\\1", coef_names))
+
+# Debug print in case of errors
+if (any(is.na(event_times))) {
+  cat("⛔ Coefficient names:", coef_names, "\n")
+  stop("❌ Failed to extract numeric event times.")
+}
+
+# Order everything properly
+sorted_index <- order(event_times)
+betahat <- event_coef[sorted_index]
+sigma <- vcov(event_model)[sorted_index, sorted_index]
+event_times <- event_times[sorted_index]
+
+# Define pre/post periods
+pre_periods <- event_times[event_times < 0]
+post_periods <- event_times[event_times >= 0]
+
+# ❗Sanity check
+if (length(betahat) != length(pre_periods) + length(post_periods)) {
+  stop("❌ Length mismatch: betahat does not match pre + post periods.")
+}
+
+# Define parameter of interest (t = 0)
+l_vec <- basisVector(index = which(event_times == 0), size = length(event_times))
+
+# 4. Run HonestDiD smoothness bounds
+smooth_result <- createSensitivityResults(
+  betahat = betahat,
+  sigma = sigma,
+  numPrePeriods = length(pre_periods),
+  numPostPeriods = length(post_periods),
+  l_vec = l_vec,
+  Mvec = c(0, 0.01, 0.03, 0.05)
+)
+
+# 5. Original OLS confidence set
+original_ci <- constructOriginalCS(
+  betahat = betahat,
+  sigma = sigma,
+  numPrePeriods = length(pre_periods),
+  numPostPeriods = length(post_periods),
+  l_vec = l_vec
+)
+
+# 6. Plot results (guaranteed to show)
+plot_obj <- createSensitivityPlot(
+  robustResults = smooth_result,
+  originalResults = original_ci
+)
+
+print(plot_obj)
