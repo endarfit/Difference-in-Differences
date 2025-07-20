@@ -1,0 +1,77 @@
+# Install & load required packages
+install.packages(c("fixest", "ggplot2", "remotes", "Rmpfr", "gmp", "CVXR"))
+remotes::install_github("asheshrambachan/HonestDiD", force = TRUE)
+
+library(fixest)
+library(ggplot2)
+library(HonestDiD)
+
+# Data Setup: Pre-trend with curvature + smaller treatment effect
+set.seed(777)
+n <- 1000
+time_periods <- -5:4
+df <- expand.grid(id = 1:n, time = time_periods)
+
+df$treated <- ifelse(df$id <= n/2, 1, 0)
+df$post <- ifelse(df$time >= 0 & df$treated == 1, 1, 0)
+
+# Now: strong non-parallel pre-trend, but we don't drop it
+df$trend <- 0.5 * df$time + ifelse(df$treated == 1, 0.2 * (df$time)^2, 0)
+df$treatment_effect <- ifelse(df$post == 1, 1, 0)  # smaller true effect
+df$y <- df$trend + df$treatment_effect + rnorm(n * length(time_periods))
+
+df$event_time <- factor(df$time, levels = time_periods)
+
+# Event-study estimation
+event_model <- feols(y ~ i(event_time, treated, ref = "-2") | id + time, data = df)
+
+# Extract coefficients
+event_coef <- coef(event_model)
+event_se <- se(event_model)
+coef_names <- names(event_coef)
+event_times <- as.numeric(gsub("event_time::(-?[0-9]+):treated", "\\1", coef_names))
+
+# Sort
+sorted_index <- order(event_times)
+betahat <- event_coef[sorted_index]
+sigma <- vcov(event_model)[sorted_index, sorted_index]
+event_times <- event_times[sorted_index]
+
+# Pre/post periods
+pre_periods <- event_times[event_times < 0]
+post_periods <- event_times[event_times >= 0]
+
+# l_vec for t = 0
+t0_index <- which(post_periods == 0)
+l_vec <- basisVector(index = t0_index, size = length(post_periods))
+
+# HonestDiD: Relative Magnitude Bounds
+relmag_result <- createSensitivityResults_relativeMagnitudes(
+  betahat = betahat,
+  sigma = sigma,
+  numPrePeriods = length(pre_periods),
+  numPostPeriods = length(post_periods),
+  l_vec = l_vec,
+  Mbarvec = c(0, 0.5, 1, 2, 3),
+  bound = "deviation from linear trend"
+)
+
+# Naive CI
+original_ci <- constructOriginalCS(
+  betahat = betahat,
+  sigma = sigma,
+  numPrePeriods = length(pre_periods),
+  numPostPeriods = length(post_periods),
+  l_vec = l_vec
+)
+
+# Plot
+plot_obj <- createSensitivityPlot_relativeMagnitudes(
+  robustResults = relmag_result,
+  originalResults = original_ci
+)
+print(plot_obj)
+
+# Save
+ggsave("HonestDiD_RelMag_NonRobust.png", plot = plot_obj, width = 8, height = 5, dpi = 300)
+cat("📁 Saved to:", getwd(), "/HonestDiD_RelMag_NonRobust.png\n")
