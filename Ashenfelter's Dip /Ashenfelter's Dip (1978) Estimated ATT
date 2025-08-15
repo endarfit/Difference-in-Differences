@@ -1,0 +1,74 @@
+# Install if needed
+install.packages("fixest")
+library(fixest)
+
+# Parameters
+set.seed(2025)
+n <- 1000
+time_periods <- -5:4
+true_ATT <- 3
+n_sims <- 1000
+
+# Output
+estimates <- numeric(n_sims)
+
+# Monte Carlo Loop
+for (s in 1:n_sims) {
+  df <- expand.grid(id = 1:n, time = time_periods)
+  df$treated <- ifelse(df$id <= n/2, 1, 0)
+  df$post <- ifelse(df$time >= 0 & df$treated == 1, 1, 0)
+  df$base_trend <- 0.5 * df$time
+  df$dip <- ifelse(df$treated == 1 & df$time == -1, -4, 0)
+  df$treatment_effect <- ifelse(df$post == 1, true_ATT, 0)
+  df$y <- df$base_trend + df$dip + df$treatment_effect + rnorm(n * length(time_periods))
+  
+  # Drop dip
+  df <- df[df$time != -1, ]
+  
+  # Factor with correct levels
+  df$event_time <- factor(df$time, levels = setdiff(time_periods, -1))  # drop t=-1
+  model <- tryCatch(
+    feols(y ~ i(event_time, treated, ref = "-2") | id + time, data = df),
+    error = function(e) return(NULL)
+  )
+  
+  # Try to find coefficient with event_time == 0
+  if (!is.null(model)) {
+    coef_names <- names(coef(model))
+    match_name <- coef_names[grepl("0", coef_names) & grepl("treated", coef_names)]
+    
+    if (length(match_name) > 0) {
+      estimates[s] <- coef(model)[match_name[1]]
+    } else {
+      estimates[s] <- NA
+    }
+  } else {
+    estimates[s] <- NA
+  }
+}
+
+# Clean results
+estimates_clean <- na.omit(estimates)
+
+# Check
+cat("✅ Valid simulations:", length(estimates_clean), "/", n_sims, "\n")
+if (length(estimates_clean) == 0) stop("❌ No valid ATT estimates. Check model spec.")
+
+# Summary
+mean_est <- mean(estimates_clean)
+bias <- mean_est - true_ATT
+rmse <- sqrt(mean((estimates_clean - true_ATT)^2))
+
+# Histogram (Base R)
+hist(estimates_clean, breaks = 40,
+     main = "Distribution of Estimated ATT (TWFE, t = 0)",
+     xlab = "Estimated ATT",
+     col = "skyblue", border = "white")
+abline(v = true_ATT, col = "red", lwd = 2, lty = 2)
+abline(v = mean_est, col = "darkgreen", lwd = 2, lty = 3)
+
+# Print results
+cat("True ATT:", true_ATT, "\n")
+cat("Mean Estimate:", round(mean_est, 3), "\n")
+cat("Bias:", round(bias, 3), "\n")
+cat("RMSE:", round(rmse, 3), "\n")
