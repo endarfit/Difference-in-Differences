@@ -1,0 +1,122 @@
+###############################################
+# Canonical multi-period DiD Monte Carlo (ATT)
+# Parallel trends, one treated cohort, one control
+# Produces bell-shaped sampling distribution plot
+###############################################
+
+## --- 0) Packages: install & load (complete header) ---
+req_pkgs <- c("tidyverse","fixest","data.table","ggplot2")
+new_pkgs <- req_pkgs[!(req_pkgs %in% installed.packages()[,"Package"])]
+if(length(new_pkgs)) install.packages(new_pkgs, dependencies = TRUE)
+
+# HonestDiD (not used in THIS script, but installed & loaded per your preference)
+if (!requireNamespace("devtools", quietly = TRUE)) install.packages("devtools")
+if (!requireNamespace("HonestDiD", quietly = TRUE)) {
+  devtools::install_github("asheshrambachan/HonestDiD", upgrade = "never")
+}
+
+library(tidyverse)
+library(fixest)
+library(data.table)
+library(HonestDiD)
+
+## --- 1) DGP parameters (feel free to tweak) ---
+set.seed(12345)
+
+N_treated   <- 100          # treated units
+N_control   <- 100          # control units
+N           <- N_treated + N_control
+T_total     <- 8            # total periods
+t_pre       <- 4            # number of pre-treatment periods (>= 3 so HonestDiD is viable later)
+t_post      <- T_total - t_pre
+treat_time  <- t_pre + 1    # first treated period (sharp adoption)
+tau_true    <- 0.50         # true constant treatment effect in post periods
+sigma_eps   <- 1.00         # idiosyncratic noise sd
+rho         <- 0.3          # AR(1) serial correlation in eps (adds realism so MC is non-degenerate)
+
+## --- 2) Helper: simulate one panel under parallel trends ---
+simulate_panel <- function() {
+  # ids
+  id <- 1:N
+  treated_ids <- 1:N_treated
+  control_ids <- (N_treated+1):N
+  
+  # time index
+  t <- 1:T_total
+  
+  # unit FE (heterogeneous intercepts allowed)
+  alpha_i <- rnorm(N, 0, 1)
+  
+  # common time shocks (parallel trends via shared gamma_t)
+  gamma_t <- seq(from = -0.3, to = 0.3, length.out = T_total)  # smooth common trend
+  
+  # build full grid
+  dt <- CJ(id = id, t = t)
+  dt[, treated := as.integer(id %in% treated_ids)]
+  dt[, post    := as.integer(t >= treat_time)]
+  dt[, D       := treated * post]  # treatment indicator
+  
+  # attach fixed effects
+  dt[, alpha_i := alpha_i[id]]
+  dt[, gamma_t := gamma_t[t]]
+  
+  # AR(1) idiosyncratic shocks for each unit
+  dt[, eps := 0.0]
+  for (i in id) {
+    idx <- which(dt$id == i)
+    e <- numeric(length(idx))
+    e[1] <- rnorm(1, 0, sigma_eps / sqrt(1 - rho^2))
+    if (length(idx) > 1) {
+      for (k in 2:length(idx)) e[k] <- rho * e[k-1] + rnorm(1, 0, sigma_eps)
+    }
+    dt$eps[idx] <- e
+  }
+  
+  # outcome: Y_it = alpha_i + gamma_t + tau*D_it + eps_it
+  dt[, y := alpha_i + gamma_t + tau_true * D + eps]
+  
+  return(dt[])
+}
+
+## --- 3) Estimator: TWFE with unit & time FE (canonical multi-period DiD) ---
+estimate_att <- function(panel_dt) {
+  # Regress y on D with unit/time FE; constant post effect identified under PT + no anticipation
+  est <- feols(y ~ D | id + t, data = panel_dt, cluster = ~id)
+  unname(coef(est)["D"])
+}
+
+## --- 4) Monte Carlo loop ---
+B <- 1000  # number of replications (increase if you want an even smoother bell)
+
+att_hats <- numeric(B)
+for (b in 1:B) {
+  dt_b <- simulate_panel()
+  att_hats[b] <- estimate_att(dt_b)
+}
+
+## --- 5) Diagnostics (bias, RMSE) ---
+mc_summary <- tibble(
+  mean_hat = mean(att_hats),
+  bias     = mean(att_hats) - tau_true,
+  sd_hat   = sd(att_hats),
+  rmse     = sqrt(mean((att_hats - tau_true)^2))
+)
+print(mc_summary)
+
+## --- 6) Plot: bell-shaped sampling distribution ---
+att_df <- tibble(att = att_hats)
+
+p <- ggplot(att_df, aes(x = att)) +
+  geom_density(linewidth = 1) +
+  geom_vline(xintercept = tau_true, linetype = "dashed", linewidth = 1, color = "red") +
+  labs(
+    title = "Monte Carlo: Sampling Distribution of ATT (Average Post)",
+    x = "Estimated ATT",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p)
+
+# Optionally save
+ggsave("mc_att_density_multi_period_DiD.png", p, width = 7, height = 3.2, dpi = 300)
