@@ -1,0 +1,222 @@
+########################################################
+# ═════════════════════════════════════════════════════
+#   📊 HonestDiD Monte Carlo Lab: RM Bounds Edition 🔥
+# ═════════════════════════════════════════════════════
+# Canonical multi-period DiD + HonestDiD (RM only)
+# Tuned to keep RM bounds tight for modest M̄
+########################################################
+
+## --- 0) Packages: install & load (complete header) ---
+req_pkgs <- c("tidyverse","fixest","data.table","ggplot2")
+new_pkgs <- req_pkgs[!(req_pkgs %in% installed.packages()[,"Package"])]
+if(length(new_pkgs)) install.packages(new_pkgs, dependencies = TRUE)
+
+if (!requireNamespace("devtools", quietly = TRUE)) install.packages("devtools")
+if (!requireNamespace("HonestDiD", quietly = TRUE)) {
+  devtools::install_github("asheshrambachan/HonestDiD", upgrade = "never")
+}
+
+library(tidyverse)
+library(fixest)
+library(data.table)
+library(HonestDiD)
+
+## --- 1) Parameters (tuned) ---
+set.seed(12345)
+
+N_treated   <- 500
+N_control   <- 500
+T_total     <- 12
+t_pre       <- 6                      # more pre periods ⇒ better calibration
+t_post      <- T_total - t_pre
+treat_time  <- t_pre + 1              # first treated period
+tau_true    <- 0.50                   # true post ATT
+sigma_eps   <- 0.50                   # lower noise
+rho         <- 0.10                   # lower serial correlation
+
+## --- 2) Simulator (no globals inside) ---
+simulate_panel <- function(N_treated, N_control, T_total, treat_time,
+                           tau_true, sigma_eps, rho) {
+  N <- N_treated + N_control
+  id <- 1:N
+  treated_ids <- 1:N_treated
+  t <- 1:T_total
+  
+  # unit heterogeneity + common trend (parallel trends)
+  alpha_i <- rnorm(N, 0, 1)
+  gamma_t <- seq(from = -0.3, to = 0.3, length.out = T_total)
+  
+  dt <- CJ(id = id, t = t)
+  dt[, treated := as.integer(id %in% treated_ids)]
+  dt[, post    := as.integer(t >= treat_time)]
+  dt[, D       := treated * post]
+  
+  dt[, alpha_i := alpha_i[id]]
+  dt[, gamma_t := gamma_t[t]]
+  
+  # AR(1) shocks
+  dt[, eps := 0.0]
+  for (i in id) {
+    idx <- which(dt$id == i)
+    e <- numeric(length(idx))
+    e[1] <- rnorm(1, 0, sigma_eps / sqrt(1 - rho^2))
+    if (length(idx) > 1) {
+      for (k in 2:length(idx)) e[k] <- rho * e[k-1] + rnorm(1, 0, sigma_eps)
+    }
+    dt$eps[idx] <- e
+  }
+  
+  # outcome and event time
+  dt[, y := alpha_i + gamma_t + tau_true * D + eps]
+  dt[, rel := t - treat_time]        # e.g., -6..-1,0..5
+  
+  dt[]
+}
+
+## --- 3) Monte Carlo for TWFE ATT (bell-shaped) ---
+estimate_att_twfe <- function(panel_dt) {
+  est <- feols(y ~ D | id + t, data = panel_dt, cluster = ~ id)
+  unname(coef(est)["D"])
+}
+
+B <- 1000
+att_hats <- numeric(B)
+for (b in 1:B) {
+  dt_b <- simulate_panel(N_treated, N_control, T_total, treat_time,
+                         tau_true, sigma_eps, rho)
+  att_hats[b] <- estimate_att_twfe(dt_b)
+}
+
+mc_summary <- tibble(
+  mean_hat = mean(att_hats),
+  bias     = mean(att_hats) - tau_true,
+  sd_hat   = sd(att_hats),
+  rmse     = sqrt(mean((att_hats - tau_true)^2))
+)
+print(mc_summary)
+
+# (Optional) density figure
+att_df <- tibble(att = att_hats)
+p_mc <- ggplot(att_df, aes(x = att)) +
+  geom_density(linewidth = 1) +
+  geom_vline(xintercept = tau_true, linetype = "dashed", linewidth = 1, color = "red") +
+  labs(title = "Monte Carlo: Sampling Distribution of ATT (TWFE)",
+       x = "Estimated ATT", y = "Density") +
+  theme_minimal(base_size = 12)
+print(p_mc)
+# ggsave("mc_att_density_multi_period_DiD.png", p_mc, width = 7, height = 3.2, dpi = 300)
+
+## --- 4) MANUAL Event Study (safe names, robust) ---
+safe_es_name <- function(K) {
+  if (K < 0) sprintf("ESK_m%d", abs(K)) else sprintf("ESK_p%d", K)
+}
+
+build_manual_es <- function(dt, refK = -1) {
+  Ks_all <- sort(unique(dt$rel))
+  Ks_use <- setdiff(Ks_all, refK)
+  for (K in Ks_use) {
+    col <- safe_es_name(K)
+    dt[, (col) := as.integer(rel == K & treated == 1)]
+  }
+  rhs_terms <- vapply(Ks_use, safe_es_name, FUN.VALUE = character(1))
+  fml <- as.formula(paste("y ~", paste(rhs_terms, collapse = " + "), "| id + t"))
+  fit <- feols(fml, data = dt, cluster = ~ id)
+  co <- coef(fit); V <- vcov(fit)
+  betas <- unname(co[rhs_terms])
+  Sigma <- V[rhs_terms, rhs_terms, drop = FALSE]
+  list(fit = fit, Ks = Ks_use, rhs = rhs_terms, betas = betas, Sigma = Sigma)
+}
+
+fit_event_study_manual <- function(dt, ref_candidates = c(-1, -2, -3)) {
+  for (refK in ref_candidates) {
+    es <- build_manual_es(copy(dt), refK = refK)
+    K  <- es$Ks
+    pre_idx  <- which(K < 0)
+    post_idx <- which(K >= 0)
+    if (length(pre_idx) >= 2 && length(post_idx) >= 1) {
+      ord_pre  <- order(K[pre_idx])
+      ord_post <- order(K[post_idx])
+      betahat  <- c(es$betas[pre_idx][ord_pre], es$betas[post_idx][ord_post])
+      idx_all  <- c(pre_idx[ord_pre], post_idx[ord_post])
+      Sigma    <- es$Sigma[idx_all, idx_all, drop = FALSE]
+      K_sorted <- c(sort(K[pre_idx]), sort(K[post_idx]))
+      rhs_sorted <- c(es$rhs[pre_idx][ord_pre], es$rhs[post_idx][ord_post])
+      return(list(ref_used = refK, betahat = betahat, Sigma = Sigma,
+                  numPre = length(pre_idx), numPost = length(post_idx),
+                  K_sorted = K_sorted, rhs_sorted = rhs_sorted))
+    }
+  }
+  stop("Need ≥2 pre and ≥1 post ES coefficients. Increase t_pre or T_total.")
+}
+
+## --- 5) Run ES and prep HonestDiD objects + sanity prints ---
+dt_es <- simulate_panel(N_treated, N_control, T_total, treat_time,
+                        tau_true, sigma_eps, rho)
+
+es <- fit_event_study_manual(dt_es, ref_candidates = c(-1, -2, -3))
+cat("Manual ES reference used (K):", es$ref_used, "\n")
+numPre     <- es$numPre
+numPost    <- es$numPost
+betahat_es <- es$betahat
+Sigma_es   <- es$Sigma
+K_sorted   <- es$K_sorted
+
+# Sanity: what RM calibrates against
+pre_K  <- K_sorted[1:numPre]
+pre_b  <- betahat_es[1:numPre]
+cat("Pre K:", paste(pre_K, collapse = " "), "\n")
+cat("Pre b:", paste(round(pre_b, 3), collapse = " "), "\n")
+cat("Max |pre| =", round(max(abs(pre_b)), 3), "\n")
+
+# Compare ES on-impact to TWFE and truth
+twfe_att <- feols(y ~ D | id + t, data = dt_es, cluster = ~id)
+es_onimpact <- betahat_es[numPre + 1]
+cat("ES on-impact =", round(es_onimpact, 3),
+    " | TWFE ATT =", round(unname(coef(twfe_att)["D"]), 3),
+    " | true =", tau_true, "\n")
+
+## --- 6) HonestDiD: RM bounds (C-LF), with finer M̄ grid ---
+l_post_onimpact <- c(1, rep(0, numPost - 1))
+l_post_avg      <- rep(1/numPost, numPost)
+
+orig_onimpact <- constructOriginalCS(
+  betahat = betahat_es, sigma = Sigma_es,
+  numPrePeriods = numPre, numPostPeriods = numPost,
+  l_vec = l_post_onimpact, alpha = 0.05
+)
+
+sens_onimpact <- createSensitivityResults_relativeMagnitudes(
+  betahat = betahat_es, sigma = Sigma_es,
+  numPrePeriods = numPre, numPostPeriods = numPost,
+  l_vec = l_post_onimpact,
+  Mbarvec = c(seq(0, 1, by = 0.25), 1.25, 1.5),   # finer grid near 0–1.5
+  method = "C-LF", gridPoints = 1500
+)
+
+orig_avgpost <- constructOriginalCS(
+  betahat = betahat_es, sigma = Sigma_es,
+  numPrePeriods = numPre, numPostPeriods = numPost,
+  l_vec = l_post_avg, alpha = 0.05
+)
+
+sens_avgpost <- createSensitivityResults_relativeMagnitudes(
+  betahat = betahat_es, sigma = Sigma_es,
+  numPrePeriods = numPre, numPostPeriods = numPost,
+  l_vec = l_post_avg,
+  Mbarvec = c(seq(0, 1, by = 0.25), 1.25, 1.5),
+  method = "C-LF", gridPoints = 1500
+)
+
+cat("\n=== RM Bounds: On-impact (K = 0) ===\n")
+print(orig_onimpact); print(sens_onimpact)
+cat("\n=== RM Bounds: Average Post ===\n")
+print(orig_avgpost);  print(sens_avgpost)
+
+## --- 7) Sensitivity plots (enabled & saved) ---
+p_rm_on  <- createSensitivityPlot_relativeMagnitudes(sens_onimpact, orig_onimpact)
+print(p_rm_on)
+ggsave("RM_onimpact_sensitivity.png", p_rm_on,  width = 7, height = 4, dpi = 300)
+
+p_rm_avg <- createSensitivityPlot_relativeMagnitudes(sens_avgpost,  orig_avgpost)
+print(p_rm_avg)
+ggsave("RM_avgpost_sensitivity.png", p_rm_avg, width = 7, height = 4, dpi = 300)
