@@ -1,0 +1,76 @@
+
+# Visually assessing the parallel trends DiD with controls
+
+# install packages
+install.packages(c("dplyr", "ggplot2", "broom"))
+
+# Load packages
+library(dplyr)
+library(ggplot2)
+library(broom)
+
+# Set seed for reproducibility
+set.seed(1997)
+
+# Parameters
+T <- 100  # Time periods
+N <- 40   # Subjects (20 control, 20 treated)
+
+# Generate data
+dat <- expand.grid(t = 1:T, i = 1:N)
+
+# Simulate AR(1) time trend
+time.trend <- as.numeric(arima.sim(n = T, list(ar = c(0.4, 0.5), ma = c(0.6, 0.5)))) * 3 + 0.7 * (1:T)
+
+# Baseline DiD setup
+dat <- dat %>%
+  mutate(
+    group = ifelse(i > N / 2, "treat", "control"),
+    treat = 1L * (group == "treat"),
+    post = 1L * (t > T / 2),
+    treat_post = post * treat,
+    mu_t = time.trend[t],
+    eps = rnorm(n()),
+    y = mu_t + treat * 40 + treat_post * 50 + eps  # True effect = 50
+  )
+
+# Check data
+sample_n(dat, 5)
+
+# Plot parallel trends (baseline)
+ggplot(dat, aes(x = t, y = y, color = group, group = interaction(group, i))) +
+  geom_line(alpha = 0.2) +
+  stat_summary(aes(group = group), fun = mean, geom = "line", size = 1.5) +
+  geom_vline(xintercept = T / 2, linetype = "dashed") +
+  labs(title = "Parallel Trends Hold (Baseline)",
+       x = "Time", y = "Outcome") +
+  theme_minimal()
+
+# DiD regression (baseline)
+tidy(lm(y ~ post * treat, data = dat))  # Should estimate ~50 for `post:treat`
+
+# Introduce a confounder violating parallel trends
+dat <- dat %>%
+  mutate(
+    x = ifelse(treat, -t, t) + runif(n()) * 2,  # Confounder trends oppositely
+    y = mu_t + treat * 40 + treat_post * 50 + 0.8 * x + eps  # New DGP
+  )
+
+# Custom plot function for non-parallel trends
+show.plot <- function(data, showmeans = TRUE, label = "") {
+  p <- ggplot(data, aes(x = t, y = y, color = group, group = interaction(group, i))) +
+    geom_line(alpha = 0.2) +
+    geom_vline(xintercept = T / 2, linetype = "dashed") +
+    labs(title = label, x = "Time", y = "Outcome") +
+    theme_minimal()
+  if (showmeans) {
+    p <- p + stat_summary(aes(group = group), fun = mean, geom = "line", size = 1.5)
+  }
+  print(p)
+}
+
+# Plot violated parallel trends
+show.plot(dat, showmeans = TRUE, label = "Pre-Trends Not Parallel (Confounder Present)")
+
+# Biased DiD estimate due to confounder
+tidy(lm(y ~ post * treat, data = dat))  # Estimate will ≠ 50 (biased)
