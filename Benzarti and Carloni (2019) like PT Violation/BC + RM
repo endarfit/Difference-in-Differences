@@ -1,0 +1,270 @@
+########################################################
+# ═════════════════════════════════════════════════════
+#   🍽️ BC-like Violation + HonestDiD (RM) — Full Script
+# ═════════════════════════════════════════════════════
+# Simulates a Benzarti & Carloni (2019)-style setting:
+#  - Treated = "Restaurants"   Control = "Other services"
+#  - Policy at event time 0
+#  - BC-like violation: treated has a mild negative pre-trend
+# Then runs event-study DiD and HonestDiD RM bounds.
+########################################################
+
+## --- 0) Packages: install & load (complete header) ---
+req_pkgs <- c("data.table","fixest","ggplot2","remotes")
+new_pkgs <- req_pkgs[!(req_pkgs %in% installed.packages()[,"Package"])]
+if(length(new_pkgs)) install.packages(new_pkgs, dependencies = TRUE)
+
+# Install/update HonestDiD from GitHub (most recent)
+if (!requireNamespace("HonestDiD", quietly = TRUE)) {
+  Sys.setenv("R_REMOTES_NO_ERRORS_FROM_WARNINGS" = "true")
+  remotes::install_github("asheshrambachan/HonestDiD")
+}
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(fixest)
+  library(ggplot2)
+  library(HonestDiD)
+})
+
+## --- 1) Simulation parameters (BC-like) ---
+set.seed(12345)
+
+N_treated <- 800        # number of restaurants
+N_control <- 800        # number of other services
+T_pre     <- 6          # pre periods excluding ref -1 (we’ll include -1 separately)
+T_post    <- 6          # post periods
+time_grid <- -T_pre:-1  # pre including -1
+time_grid <- c(time_grid, 0:(T_post-1))
+# Reference period is -1 (standard in RR/HonestDiD examples)
+
+# True treatment effect path (profits-like; >0 post-policy)
+# Think of a modest profit increase post VAT cut
+tau_post <- seq(0.06, 0.12, length.out = T_post)   # ATT per post period (log points)
+
+# BC-like differential trend (bias) for treated vs control in Y(0)
+# Pre: mild downward slope (restaurants were trending slightly down vs control)
+# Post: keep similar (slightly larger) downward slope -> bias changes slowly across time
+slope_pre  <- -0.010    # per period pre
+slope_post <- -0.012    # per period post (slightly larger magnitude than pre)
+
+# By convention in event-studies, set δ_{-1} = 0 (reference)
+delta_vec <- numeric(length(time_grid))
+names(delta_vec) <- as.character(time_grid)
+
+# Build δ_t so that δ_{-1}=0 and evolves linearly with specified slopes
+# For t<=-1: walk backward from -1 using slope_pre
+for (tt in rev(time_grid[time_grid <= -1])) {
+  if (tt == -1) {
+    delta_vec[as.character(tt)] <- 0
+  } else {
+    # one step earlier (e.g., -2 is one step before -1): add slope_pre
+    delta_vec[as.character(tt)] <- delta_vec[as.character(tt + 1)] - slope_pre
+  }
+}
+# For t>=0: continue from -1 forward using slope_post
+for (tt in time_grid[time_grid >= 0]) {
+  prev <- if (tt == 0) -1 else tt - 1
+  delta_vec[as.character(tt)] <- delta_vec[as.character(prev)] + slope_post
+}
+
+# Global time effects (macro trend common to both groups; optional)
+gamma_t <- 0.02 * time_grid
+names(gamma_t) <- as.character(time_grid)
+
+# Noise scale
+sigma_eps <- 0.08
+
+## --- 2) Build panel and generate outcomes ---
+N <- N_treated + N_control
+ids <- 1:N
+treated_ids <- 1:N_treated
+
+DT <- CJ(id = ids, time = time_grid)
+DT[, treated := as.integer(id %in% treated_ids)]
+DT[, rel_time := time]        # event time (policy at 0), ref at -1 in the regression
+
+# Unit fixed effects
+alpha_i <- rnorm(N, 0, 0.5)
+DT[, alpha := alpha_i[id]]
+
+# Time fixed effects (macro)
+DT[, gamma := gamma_t[as.character(time)]]
+
+# Differential trend δ_t (bias) loaded only for treated
+DT[, delta := ifelse(treated == 1, delta_vec[as.character(time)], 0)]
+
+# Treatment indicator D_it (post * treated)
+DT[, D := as.integer(treated == 1 & time >= 0)]
+
+# Treatment effect by post period (tau_t)
+tau_map <- tau_post
+names(tau_map) <- as.character(0:(T_post-1))
+DT[, tau := 0]
+DT[time >= 0, tau := tau_map[as.character(time)]]
+
+# Outcome: Y = alpha_i + gamma_t + (treated bias δ_t) + D * tau_t + ε
+DT[, eps := rnorm(.N, 0, sigma_eps)]
+DT[, y := alpha + gamma + delta + D * tau + eps]
+
+## --- 3) Event-study regression (fixest) ---
+# IMPORTANT: use rel_time with ref = -1 and interact with treated
+# Two-way FE: unit + time
+es_fit <- feols(
+  y ~ i(rel_time, treated, ref = -1) | id + time,
+  data = DT, cluster = ~ id
+)
+
+# Helper: extract the ES coefficients and their vcov in HonestDiD’s expected order
+extract_es_for_honestdid <- function(fit, ref_event = -1) {
+  all_coef <- coef(fit)
+  nm <- names(all_coef)
+  # fixest names like "rel_time::-3:treated", "rel_time::2:treated"
+  keep <- grepl("^rel_time::", nm) & grepl(":treated$", nm)
+  es <- all_coef[keep]
+  
+  # parse event times from names
+  ev <- sub("^rel_time::", "", nm[keep])
+  ev <- sub(":treated$", "", ev)
+  ev <- as.integer(ev)
+  
+  ord <- order(ev)
+  es <- es[ord]
+  ev <- ev[ord]
+  
+  # split into pre (<= -2) and post (>= 0); ref -1 excluded by construction
+  pre_idx  <- which(ev <= -2)
+  post_idx <- which(ev >= 0)
+  
+  betahat <- c(es[pre_idx], es[post_idx])
+  
+  # variance-covariance for these terms, ordered accordingly
+  V <- vcov(fit, cluster = ~ id)
+  es_names <- names(es)
+  V_es <- V[es_names, es_names, drop = FALSE]
+  # reorder rows/cols to [pre..., post...]
+  ord2 <- c(pre_idx, post_idx)
+  V_es <- V_es[ord2, ord2, drop = FALSE]
+  
+  list(
+    betahat = as.numeric(betahat),
+    sigma   = V_es,
+    numPre  = length(pre_idx),
+    numPost = length(post_idx),
+    timeVec = ev[ord2],        # event times for plotting
+    ref     = ref_event
+  )
+}
+
+hd <- extract_es_for_honestdid(es_fit, ref_event = -1)
+
+cat("\n--- Event-study summary ---\n")
+cat("numPrePeriods  =", hd$numPre,  "\n")
+cat("numPostPeriods =", hd$numPost, "\n")
+cat("First few betahat (pre then post):\n")
+print(round(head(hd$betahat, 8), 3))
+
+## --- 4) HonestDiD: RM bounds (Relative Magnitudes) ---
+# Target parameter: average post ATT (set l_vec to equal weights)
+l_vec <- rep(1 / hd$numPost, hd$numPost)
+
+# Original (parallel-trends) CI for reference
+orig_cs <- constructOriginalCS(
+  betahat        = hd$betahat,
+  sigma          = hd$sigma,
+  numPrePeriods  = hd$numPre,
+  numPostPeriods = hd$numPost,
+  l_vec          = l_vec,
+  alpha          = 0.05
+)
+
+# RM sensitivity results across a grid of Mbar values (0 -> 2)
+rm_res <- createSensitivityResults_relativeMagnitudes(
+  betahat        = hd$betahat,
+  sigma          = hd$sigma,
+  numPrePeriods  = hd$numPre,
+  numPostPeriods = hd$numPost,
+  method         = "C-LF",        # recommended hybrid
+  Mbarvec        = seq(0, 2, length.out = 21),
+  l_vec          = l_vec,
+  alpha          = 0.05
+)
+
+cat("\n--- Parallel-trends (Original) 95% CI for avg post ATT ---\n")
+print(orig_cs)
+
+cat("\n--- RM Robust CIs across Mbar ---\n")
+print(head(rm_res, 6))
+
+## --- 5) Plots: event-study + RM sensitivity curve ---
+# HonestDiD’s built-in event-study plot
+p_es <- try({
+  createEventStudyPlot(
+    betahat        = hd$betahat,
+    sigma          = hd$sigma,
+    numPrePeriods  = hd$numPre,
+    numPostPeriods = hd$numPost,
+    timeVec        = hd$timeVec,
+    referencePeriod = hd$ref,
+    useRelativeEventTime = TRUE
+  )
+}, silent = TRUE)
+
+if (inherits(p_es, "try-error")) {
+  message("HonestDiD createEventStudyPlot not available; drawing with ggplot2 instead.")
+  df_plot <- data.table(
+    t = c(hd$timeVec[1:hd$numPre], -1, hd$timeVec[(hd$numPre+1):(hd$numPre+hd$numPost)]),
+    beta = c(hd$betahat[1:hd$numPre], 0, hd$betahat[(hd$numPre+1):(hd$numPre+hd$numPost)]),
+    se = sqrt(diag(hd$sigma))[c(1:hd$numPre, NA, (hd$numPre+1):(hd$numPre+hd$numPost))]
+  )
+  p_es <- ggplot(df_plot, aes(t, beta)) +
+    geom_point() +
+    geom_errorbar(aes(ymin = beta - qnorm(0.975)*se, ymax = beta + qnorm(0.975)*se), width = 0.25) +
+    geom_vline(xintercept = 0, linetype = 2) +
+    geom_hline(yintercept = 0, linetype = 3) +
+    labs(x = "Event time (ref = -1)", y = "Event-study coeff.") +
+    theme_minimal()
+}
+
+print(p_es)
+
+# Sensitivity plot: RM (robust) vs Original (PT)
+p_rm <- try({
+  createSensitivityPlot_relativeMagnitudes(
+    robustResults   = rm_res,
+    originalResults = orig_cs
+  )
+}, silent = TRUE)
+
+if (inherits(p_rm, "try-error")) {
+  message("HonestDiD createSensitivityPlot_relativeMagnitudes not available; drawing simple band instead.")
+  # Quick fallback: basic line of CI width vs Mbar
+  ggdf <- data.table(Mbar = seq(0, 2, length.out = 21))
+  # merge simulated rm_res if object exists
+  if (exists("rm_res")) {
+    ggdf <- as.data.table(rm_res)
+    setnames(ggdf, old = c("M","lb","ub"), new = c("Mbar","lb","ub"), skip_absent = TRUE)
+  }
+  p_rm <- ggplot(ggdf, aes(Mbar, 0)) +
+    geom_ribbon(aes(ymin = lb, ymax = ub), alpha = 0.25) +
+    geom_hline(yintercept = 0, linetype = 3) +
+    labs(x = "Mbar (Relative Magnitudes)", y = "ATT (avg post) — Robust CI") +
+    theme_minimal()
+}
+
+print(p_rm)
+
+## --- 6) Inspect pre vs post differences to understand RM calibration ---
+# RM uses max absolute pre-period *changes* in δ_t (|Δδ| across adjacent pre periods)
+pre_times <- as.integer(names(delta_vec)[as.integer(names(delta_vec)) <= -1])
+pre_times <- pre_times[order(pre_times)]
+pre_diffs <- diff(delta_vec[as.character(pre_times)])
+post_times <- as.integer(names(delta_vec)[as.integer(names(delta_vec)) >= 0])
+post_times <- post_times[order(post_times)]
+post_diffs <- diff(delta_vec[as.character(post_times)])
+
+cat("\n--- Check RM calibration ---\n")
+cat("Max |Δδ| pre  =", round(max(abs(pre_diffs)), 4), "\n")
+cat("Max |Δδ| post =", round(max(abs(post_diffs)), 4), "\n")
+cat("So an Mbar ≥", round(max(abs(post_diffs))/max(abs(pre_diffs)), 2),
+    "would admit post deviations up to their true size in this DGP.\n")
