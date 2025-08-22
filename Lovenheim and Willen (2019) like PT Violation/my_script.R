@@ -21,6 +21,17 @@ draws the official HonestDiD plot if available, else a look-alike ggplot with ca
 
 LW_like_PT_violation_SR.png — example plot produced by the script.
 
+| Component        | LW / RR                                                   | This repo                                                           |
+| ---------------- | --------------------------------------------------------- | ------------------------------------------------------------------- |
+| Data             | ACS cohort-by-state (staggered DTB timing)                | **Synthetic** panel                                                 |
+| Identification   | Event-study across cohorts & states                       | Event-study in simulated panel                                      |
+| Pretrends        | **Male**: \~flat; **Female**: **downward**                | We **impose** a smooth downward pretrend for treated                |
+| Target estimand  | RR focus on **employment at $r=15$** years post (θ = τ₁₅) | Default target is **average effect over post** periods (changeable) |
+| Reference period | RR use **−2** (due to partial treatment concerns at −1)   | We use **−1** (can switch)                                          |
+| Sensitivity set  | $\mathcal{S}D(M)$, FLCIs                                  | Same $\mathcal{S}D(M)$, FLCIs via **HonestDiD**                     |
+| M-grid           | \~0 to 0.04 in RR LW example                              | **0–0.04** (dense near 0) to match look                             |
+
+
 Quick start
 # 1) Install dependencies (first time)
 install.packages(c("fixest","data.table","dplyr","ggplot2","remotes"))
