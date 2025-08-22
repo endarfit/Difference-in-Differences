@@ -1,0 +1,179 @@
+########################################################
+# LW-like violation + SR (HonestDiD) — Female panel look
+# - Tiny M axis (0–0.04), units in percentage points (p.p.)
+# - Blue "Original" CI below zero + red FLCI widening with M
+########################################################
+
+## --- 0) Packages ---
+req_pkgs <- c("fixest","data.table","dplyr","ggplot2")
+new_pkgs <- req_pkgs[!(req_pkgs %in% installed.packages()[,"Package"])]
+if (length(new_pkgs)) install.packages(new_pkgs, dependencies = TRUE)
+
+# HonestDiD (any version OK; we prefer GitHub if not present)
+if (!requireNamespace("HonestDiD", quietly = TRUE)) {
+  if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
+  try({
+    remotes::install_github("asheshrambachan/HonestDiD", upgrade = "never")
+  }, silent = TRUE)
+  if (!requireNamespace("HonestDiD", quietly = TRUE)) install.packages("HonestDiD")
+}
+
+suppressPackageStartupMessages({
+  library(fixest)
+  library(data.table)
+  library(dplyr)
+  library(ggplot2)
+  library(HonestDiD)
+})
+
+## --- 1) DGP tuned to mimic LW Female panel look ---
+set.seed(20250822)
+
+N_treated <- 800
+N_control <- 800
+N         <- N_treated + N_control
+
+# Pre = -6:-1, Post = 0:8  (reference = -1)
+t_pre  <- -6:-1
+t_post <- 0:8
+tt     <- c(t_pre, t_post)
+
+# True causal effect set near zero so bias shows
+tau_true  <- 0.0
+sigma_eps <- 1.0
+
+# Smooth differential trend (treated minus control in y(0)):
+# downward pretreatment drift that keeps bending smoothly
+b_slope  <- -0.25            # more negative to push Original below 0
+c_curv   <- -0.02            # mild curvature (bounded second differences)
+delta_fun <- function(t) b_slope * t + 0.5 * c_curv * t^2
+
+# simulate
+DT <- CJ(id = 1:N, time = tt)
+DT[, treated := as.integer(id <= N_treated)]
+alpha_i  <- rnorm(N, 0, 1);               DT[, alpha  := alpha_i[id]]
+lambda_t <- rnorm(length(tt), 0, 0.4); names(lambda_t) <- tt
+DT[, lambda := lambda_t[as.character(time)]]
+DT[, eps := rnorm(.N, 0, sigma_eps)]
+DT[, delta_t := delta_fun(time)]
+DT[, y0 := alpha + lambda + (treated * delta_t)]
+DT[, treat_on := as.integer(time >= 0 & treated == 1)]
+DT[, y := y0 + tau_true * treat_on + eps]
+DT[, rel_time := time]
+
+## --- 2) Event-study (TWFE) ---
+es_fit <- feols(
+  y ~ i(rel_time, treated, ref = -1) | id + time,
+  cluster = ~ id, data = DT
+)
+
+# extract betas & Sigma in pre-then-post order
+extract_es_manual <- function(fit, pre_periods, post_periods, ref_period = -1) {
+  cf <- coef(fit); nm <- names(cf)
+  keep   <- grepl("^rel_time::", nm) & grepl(":treated$", nm)
+  cf_es  <- cf[keep]
+  etimes <- as.integer(sub(".*rel_time::(-?\\d+):treated$", "\\1", names(cf_es)))
+  ord    <- order(etimes); etimes <- etimes[ord]; cf_es <- cf_es[ord]
+  stopifnot(!(ref_period %in% etimes))
+  pre_idx  <- which(etimes %in% pre_periods)
+  post_idx <- which(etimes %in% post_periods)
+  betahat  <- c(cf_es[pre_idx], cf_es[post_idx])
+  V    <- vcov(fit, cluster = "id")
+  V_es <- V[keep, keep, drop = FALSE]; V_es <- V_es[ord, ord, drop = FALSE]
+  Sigma <- V_es[c(pre_idx, post_idx), c(pre_idx, post_idx), drop = FALSE]
+  list(betahat=betahat, Sigma=Sigma,
+       times_pre=etimes[pre_idx], times_post=etimes[post_idx])
+}
+
+hd <- extract_es_manual(
+  es_fit,
+  pre_periods  = setdiff(t_pre, -1),
+  post_periods = t_post,
+  ref_period   = -1
+)
+numPre  <- length(hd$times_pre)
+numPost <- length(hd$times_post)
+
+## --- 3) SR calibration & grid (tiny M axis like LW figure) ---
+sec_diff_pre <- diff(diff(hd$betahat[1:numPre]))
+M_calib <- if (length(sec_diff_pre)) max(abs(sec_diff_pre)) else 0
+
+# Use a fine grid in [0, 0.04]; include a few near 0
+M_grid <- sort(unique(round(c(0,
+                              seq(0.0025, 0.010, by=0.0025),
+                              seq(0.0125,0.040, by=0.0025)), 4)))
+
+# Target: average post ATT (same as LW figure uses an average horizon)
+l_vec <- rep(1/numPost, numPost)
+
+## --- 4) SR (FLCI) via HonestDiD ---
+sr_results <- createSensitivityResults(
+  betahat        = hd$betahat,
+  sigma          = hd$Sigma,
+  numPrePeriods  = numPre,
+  numPostPeriods = numPost,
+  Mvec           = M_grid,
+  l_vec          = l_vec,
+  method         = "FLCI",
+  alpha          = 0.05
+)
+
+## --- 5) "Original (PT)" CI (blue) ---
+post_idx  <- (numPre + 1):(numPre + numPost)
+theta_hat <- as.numeric(l_vec %*% hd$betahat[post_idx])
+Sigma_post <- hd$Sigma[post_idx, post_idx, drop = FALSE]
+se_theta  <- sqrt(as.numeric(t(l_vec) %*% Sigma_post %*% l_vec))
+orig_lb   <- theta_hat - qnorm(0.975)*se_theta
+orig_ub   <- theta_hat + qnorm(0.975)*se_theta
+
+## --- 6) Plot — prefer HonestDiD plot helper if present ---
+# scale to p.p. (×100), small M axis (0–0.04), caps, blue vs red
+plotted <- FALSE
+if (exists("plotSensitivityResults", where=asNamespace("HonestDiD"), inherits=FALSE)) {
+  # Some builds accept a 'scale' argument (if not, we’ll fallback below)
+  try({
+    p <- HonestDiD::plotSensitivityResults(sr_results)
+    print(p); plotted <- TRUE
+  }, silent = TRUE)
+}
+if (!plotted && exists("createSensitivityPlot", where=asNamespace("HonestDiD"), inherits=FALSE)) {
+  try({
+    p <- HonestDiD::createSensitivityPlot(sr_results)
+    print(p); plotted <- TRUE
+  }, silent = TRUE)
+}
+
+## --- 7) If no HonestDiD plot helper, draw LW-style ggplot (look-alike) ---
+if (!plotted) {
+  # Build data frame in p.p.
+  df_flci <- sr_results |>
+    mutate(M = as.numeric(M),
+           lb_pp = lb*100, ub_pp = ub*100, type = "FLCI") |>
+    select(M, lb_pp, ub_pp, type)
+  
+  # Blue bar placed slightly left of first tick (still on-axis)
+  x0 <- min(df_flci$M, na.rm = TRUE)
+  df_orig <- data.frame(
+    M    = x0 - 0.002,   # tiny left shift to separate
+    lb_pp= orig_lb*100,
+    ub_pp= orig_ub*100,
+    type = "Original"
+  )
+  
+  plot_df <- bind_rows(df_orig, df_flci)
+  
+  gg <- ggplot(plot_df, aes(x = M, ymin = lb_pp, ymax = ub_pp, color = type)) +
+    geom_errorbar(width = 0.0015, linewidth = 0.9) +
+    geom_hline(yintercept = 0, linewidth = 0.6) +
+    scale_color_manual(values = c("FLCI" = "#d73027", "Original" = "#4575b4")) +
+    coord_cartesian(xlim = c(0, 0.04)) +
+    labs(title = "Female Employment (p.p.)", x = "M", y = NULL, color = NULL) +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "bottom",
+          panel.grid.minor = element_blank())
+  print(gg)
+}
+
+## --- (optional) console context in p.p.
+cat(sprintf("\nCalibrated M* = %.4f ; Original (PT) 95%% CI (p.p.): [%.2f, %.2f]\n",
+            M_calib, 100*orig_lb, 100*orig_ub))
