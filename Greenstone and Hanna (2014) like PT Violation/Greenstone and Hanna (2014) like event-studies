@@ -1,0 +1,270 @@
+########################################################
+# Monotone-Upward PT Violation (Greenstone & Hanna style)
+# Event-study + Identified set under Monotone + Post-Sign + Box
+# Minimal constraints -> robustly feasible & bounded
+########################################################
+
+## --- 0) Install & load packages ---
+req_pkgs <- c("fixest","data.table","ggplot2","Matrix","broom","lpSolve","remotes")
+new_pkgs <- req_pkgs[!(req_pkgs %in% installed.packages()[,"Package"])]
+if(length(new_pkgs)) install.packages(new_pkgs, dependencies = TRUE)
+
+# Try HonestDiD (optional; not required for this script to run)
+if (!requireNamespace("HonestDiD", quietly = TRUE)) {
+  try(remotes::install_github("asheshrambachan/HonestDiD", force = TRUE), silent = TRUE)
+}
+
+suppressPackageStartupMessages({
+  library(fixest)
+  library(data.table)
+  library(ggplot2)
+  library(Matrix)
+  library(broom)
+  library(lpSolve)
+  ok_HD <- requireNamespace("HonestDiD", quietly = TRUE)
+  if (ok_HD) library(HonestDiD)
+})
+
+set.seed(12345)
+
+########################################################
+# 1) Simulate a Greenstone & Hanna (2014)-style panel
+#    Monotone upward differential trend (bias) in treated
+########################################################
+
+# Panel setup
+N_treat   <- 120
+N_control <- 120
+N         <- N_treat + N_control
+
+preT      <- 5                 # pre periods:  -5,-4,-3,-2,-1  (with -1 omitted in ES)
+postT     <- 6                 # post periods:  0,1,2,3,4,5
+ev_times  <- -preT:postT
+
+# Balanced panel
+DT <- CJ(id = 1:N, t = ev_times)
+DT[, treat := as.integer(id <= N_treat)]
+DT[, rel_time := t]
+
+# Unit FE and secular drift
+alpha_i <- rnorm(N, 0, 0.6)
+DT[, ai := alpha_i[id]]
+DT[, g_t := 0.05 * t]
+
+# Monotone upward differential trend (bias) for treated
+delta_fun <- function(tt) 0.08 * (tt + preT)  # rises by 0.08 per period
+DT[, delta_bias := ifelse(treat==1, delta_fun(t), 0)]
+
+# True treatment effect after 0 (policy reduces pollution)
+tau_true <- -0.35
+DT[, tau_it := ifelse(treat==1 & t>=0, tau_true, 0)]
+
+# Noise and outcome
+DT[, eps := rnorm(.N, 0, 0.4)]
+DT[, Y := ai + g_t + delta_bias + tau_it + eps]
+
+########################################################
+# 2) Event-study with fixest (ref period = -1)
+########################################################
+DT[, time := t]
+
+es_fit <- feols(
+  Y ~ i(rel_time, treat, ref = -1) | id + time,
+  data = DT
+)
+
+# Extract ES coefficients & robust vcov in a consistent order
+all_times <- setdiff(ev_times, -1)  # ES excludes -1 (reference)
+coef_names <- paste0("rel_time::", all_times, ":treat")
+coef_names <- coef_names[coef_names %in% names(es_fit$coefficients)]
+
+betahat <- as.numeric(es_fit$coefficients[coef_names]); names(betahat) <- coef_names
+Sigma_full_vcov <- vcov(es_fit, se = "hetero")
+Sigma <- as.matrix(Sigma_full_vcov[coef_names, coef_names, drop = FALSE])
+
+# Split pre / post (w.r.t. -1)
+pre_idx  <- which(all_times < 0)
+post_idx <- which(all_times >= 0)
+
+betahat_pre  <- betahat[pre_idx]
+betahat_post <- betahat[post_idx]
+
+Sigma_pre  <- Sigma[pre_idx,  pre_idx,  drop=FALSE]
+Sigma_post <- Sigma[post_idx, post_idx, drop=FALSE]
+Sigma_pp   <- Sigma[pre_idx,  post_idx, drop=FALSE]
+Sigma_ppt  <- t(Sigma_pp)
+
+numPre  <- length(pre_idx)
+numPost <- length(post_idx)
+
+# Target ATT period (post)
+target_et <- 2L
+post_times_vec <- all_times[post_idx]
+if(!(target_et %in% post_times_vec)) stop("Target post event time not available.")
+l_vec <- as.numeric(post_times_vec == target_et)
+
+########################################################
+# 3) Polyhedral Ω: Monotone ↑ + Post sign + Global Box
+#    (No pre-bands, No RM caps -> simplest robustly feasible set)
+########################################################
+
+# Orders and helpers
+pre_times_sorted  <- sort(all_times[pre_idx])    # e.g., -5,-4,-3,-2
+post_times_sorted <- sort(all_times[post_idx])   # e.g., 0,1,2,3,4,5
+Ttot <- numPre + numPost
+
+map_pos <- function(tt) {
+  if (tt < 0) which(pre_times_sorted == tt) else numPre + which(post_times_sorted == tt)
+}
+
+A_list <- list(); d_list <- list()
+
+## 3.1 Monotone increasing across all adjacent times (pre then post)
+# delta_{t+1} - delta_t >= 0   <=>   -(delta_{t+1}-delta_t) <= 0
+all_times_ordered <- c(pre_times_sorted, post_times_sorted)
+if (length(all_times_ordered) >= 2) {
+  for (k in 1:(length(all_times_ordered)-1)) {
+    i1 <- map_pos(all_times_ordered[k])
+    i2 <- map_pos(all_times_ordered[k+1])
+    a  <- rep(0, Ttot); a[i2] <- -1; a[i1] <- +1
+    A_list[[length(A_list)+1]] <- a
+    d_list[[length(d_list)+1]] <- 0
+  }
+}
+
+## 3.2 Anchor to omitted ref (-1) = 0: implies delta_{-2} <= 0
+if (numPre > 0) {
+  closest_pre <- max(pre_times_sorted)  # typically -2
+  j <- map_pos(closest_pre)
+  a <- rep(0, Ttot); a[j] <- +1
+  A_list[[length(A_list)+1]] <- a
+  d_list[[length(d_list)+1]] <- 0
+}
+
+## 3.3 Post sign: delta_t >= 0 for t >= 0   <=>   -delta_t <= 0
+for (tt in post_times_sorted) {
+  i <- map_pos(tt)
+  a <- rep(0, Ttot); a[i] <- -1
+  A_list[[length(A_list)+1]] <- a
+  d_list[[length(d_list)+1]] <- 0
+}
+
+## 3.4 Global box bounds for numerical boundedness: -B <= delta_j <= B
+# (Keeps LP bounded even without RM caps.)
+Bbox <- 10  # moderate, adjust if you wish
+for (j in seq_len(Ttot)) {
+  # upper:  delta_j <=  Bbox
+  a <- rep(0, Ttot); a[j] <- +1
+  A_list[[length(A_list)+1]] <- a
+  d_list[[length(d_list)+1]] <- Bbox
+  # lower: -delta_j <=  Bbox  -> delta_j >= -Bbox
+  a <- rep(0, Ttot); a[j] <- -1
+  A_list[[length(A_list)+1]] <- a
+  d_list[[length(d_list)+1]] <- Bbox
+}
+
+A <- do.call(rbind, A_list)
+d <- as.numeric(do.call(c, d_list))
+
+########################################################
+# 4) Inference
+#    (A) If polyhedral ARP is available: use HonestDiD.
+#    (B) Else: compute identified set endpoints via two LPs.
+########################################################
+
+use_polyhedral <- ok_HD && ("createSensitivityResults_polyhedral" %in% getNamespaceExports("HonestDiD"))
+
+if (use_polyhedral) {
+  message("Using HonestDiD::createSensitivityResults_polyhedral (ARP hybrid).")
+  beta_full <- c(
+    betahat_pre[order(pre_times_sorted)],
+    betahat_post[order(post_times_sorted)]
+  )
+  Sigma_full <- rbind(
+    cbind(Sigma_pre[order(pre_times_sorted),  order(pre_times_sorted),  drop=FALSE],
+          Sigma_pp [order(pre_times_sorted),  order(post_times_sorted), drop=FALSE]),
+    cbind(Sigma_ppt[order(post_times_sorted), order(pre_times_sorted),  drop=FALSE],
+          Sigma_post[order(post_times_sorted), order(post_times_sorted), drop=FALSE])
+  )
+
+  sens_poly <- HonestDiD::createSensitivityResults_polyhedral(
+    betahat = beta_full,
+    sigma = Sigma_full,
+    numPrePeriods  = numPre,
+    numPostPeriods = numPost,
+    l_vec = l_vec[order(post_times_sorted)],
+    A = A, d = d,
+    alpha = 0.05,
+    hybrid_flag = TRUE
+  )
+
+  cat("\n==== HonestDiD Polyhedral Robust Confidence Set (95%) ====\n")
+  print(sens_poly$Confidence.Set)
+  cat("\nPoint estimate (OLS, target period): ",
+      sum(l_vec * as.numeric(betahat_post)), "\n", sep = "")
+
+} else {
+  message("Polyhedral ARP interface not available. Computing identified set via LP (partial-ID; no sampling).")
+
+  # Objective over [pre..., post...] order to max/min l' delta_post
+  cvec <- rep(0, Ttot)
+  cvec[(numPre+1):Ttot] <- l_vec[order(post_times_sorted)]
+
+  # First: check feasibility (minimize 0 subject to constraints)
+  feas <- lp(direction = "min",
+             objective.in = rep(0, Ttot),
+             const.mat = A,
+             const.dir = rep("<=", nrow(A)),
+             const.rhs = d)
+  if (feas$status != 0) stop("Constraint set is infeasible; please report this case.")
+
+  # Max & Min l' delta_post
+  sol_max <- lp(direction = "max",
+                objective.in = cvec,
+                const.mat = A,
+                const.dir = rep("<=", nrow(A)),
+                const.rhs = d)
+  if (sol_max$status != 0) stop("Maximization LP infeasible or unbounded (unexpected with box bounds).")
+  bmax <- sol_max$objval
+
+  sol_min <- lp(direction = "min",
+                objective.in = cvec,
+                const.mat = A,
+                const.dir = rep("<=", nrow(A)),
+                const.rhs = d)
+  if (sol_min$status != 0) stop("Minimization LP infeasible or unbounded (unexpected with box bounds).")
+  bmin <- sol_min$objval
+
+  # Identified set for theta = l' tau_post
+  theta_hat_post <- sum(l_vec * as.numeric(betahat_post))
+  ID_lb <- theta_hat_post - bmax
+  ID_ub <- theta_hat_post - bmin
+
+  cat("\n==== Identified Set (Monotone ↑ + Post sign + Box bounds) ====\n")
+  cat(sprintf("[ %.3f , %.3f ]\n", ID_lb, ID_ub))
+  cat("Note: partial-ID set (no sampling). To tighten, add RM caps or pre-bands once this basic version runs for you.\n")
+}
+
+########################################################
+# 5) Diagnostic: Event-study plot
+########################################################
+es_df <- data.frame(
+  et = all_times,
+  beta = as.numeric(betahat),
+  se = sqrt(pmax(diag(Sigma), 0))
+)
+gg <- ggplot(es_df, aes(x = et, y = beta)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = -1, linetype = "dotted") +
+  geom_point() +
+  geom_errorbar(aes(ymin = beta - 1.96*se, ymax = beta + 1.96*se), width = 0.1) +
+  labs(
+    title = "Event-study: Treated vs Control (Monotone Upward Pre-trend in Treated)",
+    x = "Event time (−1 normalized to 0)", y = "Difference vs control"
+  ) +
+  theme_minimal(base_size = 13)
+print(gg)
+
+########################################################
+# End of script
+########################################################
