@@ -1,0 +1,204 @@
+###############################################################
+# Canonical multi-period DiD:
+# - Single-run event-study plot: estimates + 95% CIs + true τ_k
+# - Optional Monte Carlo summary (mean path + MC bands + coverage)
+###############################################################
+
+## 0) Packages (install if missing) -------------------------------------------
+req <- c("data.table","fixest","ggplot2","broom")
+new <- req[!(req %in% installed.packages()[,"Package"])]
+if (length(new)) install.packages(new, dependencies = TRUE)
+
+# Keep HonestDiD in your environment per your standard setup (not used directly here)
+if (!requireNamespace("HonestDiD", quietly = TRUE)) {
+  if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
+  remotes::install_github("asheshrambachan/HonestDiD")
+}
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(fixest)
+  library(ggplot2)
+  library(broom)
+  library(HonestDiD)
+})
+
+set.seed(12345)
+
+## 1) Design choices -----------------------------------------------------------
+N           <- 200      # units
+T_pre       <- 5        # pre: -T_pre..-1  (>=2 because k=-1 is reference)
+T_post      <- 5        # post: 0..T_post-1
+sigma_alpha <- 1.0
+sigma_eps   <- 1.0
+trend_slope <- 0.0
+tau_const   <- 1.0
+
+# Toggle Monte Carlo extras
+RUN_MC <- TRUE
+R      <- 1000
+
+# True dynamic effect function τ(k) for k >= 0; pre = 0
+true_tau_fun <- function(k) {
+  # Constant ATT (default):
+  rep(tau_const, length(k))
+  # Example dynamic ATT (uncomment to use):
+  # ifelse(k >= 0, pmin(1.5, 0.5 + 0.3 * k), 0)
+}
+
+## 2) Helpers to simulate & estimate ------------------------------------------
+simulate_canonical_did <- function(N, T_pre, T_post, sigma_alpha, sigma_eps, trend_slope) {
+  stopifnot(T_pre >= 2)
+  t_vec <- seq(-T_pre, T_post - 1)
+  TT    <- length(t_vec)
+  
+  id <- 1:N
+  treated_ids <- sample(id, size = round(0.5 * N), replace = FALSE)
+  
+  alpha_i  <- rnorm(N, 0, sigma_alpha)
+  lambda_t <- rnorm(TT, 0, 0.5) + trend_slope * t_vec
+  
+  dt <- data.table(
+    id   = rep(id, each = TT),
+    time = rep(t_vec, times = N)
+  )
+  dt[, treated := as.integer(id %in% treated_ids)]
+  dt[, alpha   := alpha_i[id]]
+  dt[, lambda  := lambda_t[match(time, t_vec)]]
+  
+  # Event time relative to treatment at t=0 for treated units
+  dt[, event_time := time]
+  
+  # Truth τ_k only for treated & k>=0
+  K_post  <- seq(0, T_post - 1)
+  tau_map <- setNames(true_tau_fun(K_post), K_post)
+  dt[, tau_true := 0]
+  dt[treated == 1 & event_time %in% K_post, tau_true := tau_map[as.character(event_time)]]
+  
+  # Outcome
+  dt[, eps := rnorm(.N, 0, sigma_eps)]
+  dt[, y   := alpha + lambda + tau_true + eps]
+  
+  # Event-time dummies for treated (omit k=-1)
+  K_pre <- seq(-T_pre, -2)
+  K_all <- c(K_pre, K_post)
+  k_var <- function(k) if (k >= 0) sprintf("Dk_p%d", k) else sprintf("Dk_m%d", abs(k))
+  for (k in K_all) {
+    v <- k_var(k)
+    dt[[v]] <- as.integer(dt$treated == 1 & dt$event_time == k)
+  }
+  
+  # Also return tidy "truth by k" for plotting
+  truth_tbl <- data.table(
+    k = c(K_pre, K_post),
+    truth = c(rep(0, length(K_pre)), true_tau_fun(K_post))
+  )
+  
+  list(dt = dt, K = K_all, k_var = k_var, truth_tbl = truth_tbl)
+}
+
+estimate_event_study <- function(dt, K, k_var) {
+  rhs <- paste(vapply(K, k_var, character(1)), collapse = " + ")
+  fml <- as.formula(paste0("y ~ ", rhs, " | id + time"))
+  mod <- feols(fml, data = dt, cluster = ~ id)
+  
+  est <- broom::tidy(mod, conf.int = TRUE, conf.level = 0.95)
+  est <- est[grepl("^Dk_", est$term), ]
+  data.table::setDT(est)
+  
+  # Parse k robustly (avoid ifelse to prevent coercion warnings)
+  est[, k := NA_integer_]
+  est[grepl("^Dk_m", term), k := -as.integer(sub("^Dk_m", "", term))]
+  est[grepl("^Dk_p", term), k :=  as.integer(sub("^Dk_p", "", term))]
+  est <- est[!is.na(k)][order(k)]
+  
+  est[, .(k, estimate, conf.low, conf.high, std.error)]
+}
+
+## 3) Single-run: make the requested event-study plot --------------------------
+sim1 <- simulate_canonical_did(N, T_pre, T_post, sigma_alpha, sigma_eps, trend_slope)
+es1  <- estimate_event_study(sim1$dt, sim1$K, sim1$k_var)
+
+# Merge with truth for overlay
+plot_dt <- merge(es1, sim1$truth_tbl, by = "k", all.x = TRUE, sort = TRUE)
+
+p_single <- ggplot(plot_dt, aes(x = k)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dotted") +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.25) +
+  geom_point(aes(y = estimate), size = 2) +
+  geom_line(aes(y = truth), linewidth = 1, linetype = "longdash") +
+  labs(
+    title = "Event-study (Single Simulation): Estimate ± 95% CI with True Effect",
+    x = "Event time (k)",
+    y = "Effect vs. k = -1 (reference)"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave("event_study_single.png", p_single, width = 8, height = 5, dpi = 300)
+cat('Saved "event_study_single.png"\n')
+
+## 4) Optional Monte Carlo summary (mean path + MC bands + coverage) ----------
+if (RUN_MC) {
+  K_pre  <- seq(-T_pre, -2)
+  K_post <- seq(0, T_post - 1)
+  K_all  <- c(K_pre, K_post)
+  
+  all_results <- vector("list", R)
+  for (r in 1:R) {
+    sim <- simulate_canonical_did(N, T_pre, T_post, sigma_alpha, sigma_eps, trend_slope)
+    est <- estimate_event_study(sim$dt, sim$K, sim$k_var)
+    # Truth by k: 0 pre, τ(k) post
+    est[, truth := fifelse(k >= 0, true_tau_fun(k), 0)]
+    est[, covered := as.integer(conf.low <= truth & truth <= conf.high)]
+    est[, rep := r]
+    all_results[[r]] <- est
+    if (r %% 100 == 0) cat("Completed replication:", r, "\n")
+  }
+  res <- data.table::rbindlist(all_results, use.names = TRUE, fill = TRUE)
+  
+  mc_summary <- res[, .(
+    mean_hat = mean(estimate),
+    sd_hat   = sd(estimate),
+    bias     = mean(estimate - truth),
+    rmse     = sqrt(mean((estimate - truth)^2)),
+    cover_95 = mean(covered),
+    q025     = quantile(estimate, 0.025),
+    q975     = quantile(estimate, 0.975),
+    truth    = unique(truth)
+  ), by = k][order(k)]
+  
+  data.table::fwrite(mc_summary, "mc_event_study_summary.csv")
+  cat('Saved "mc_event_study_summary.csv"\n')
+  
+  # MC mean + bands + truth
+  p_band <- ggplot(mc_summary, aes(x = k)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dotted") +
+    geom_ribbon(aes(ymin = q025, ymax = q975), alpha = 0.2) +
+    geom_line(aes(y = mean_hat), linewidth = 1) +
+    geom_point(aes(y = mean_hat), size = 1.8) +
+    geom_line(aes(y = truth), linewidth = 1, linetype = "longdash") +
+    labs(title = "Monte Carlo Event-Study: Mean Path and Pointwise 95% MC Bands",
+         x = "Event time (k)",
+         y = "Effect vs. k = -1 (reference)") +
+    theme_minimal(base_size = 12)
+  ggsave("mc_event_study_bands.png", p_band, width = 8, height = 5, dpi = 300)
+  cat('Saved "mc_event_study_bands.png"\n')
+  
+  # Coverage plot
+  p_cov <- ggplot(mc_summary, aes(x = k, y = cover_95)) +
+    geom_hline(yintercept = 0.95, linetype = "dashed") +
+    geom_point(size = 2) +
+    geom_line() +
+    scale_y_continuous(limits = c(0, 1)) +
+    labs(title = "Empirical Coverage of 95% Clustered CIs (Pointwise)",
+         x = "Event time (k)", y = "Coverage rate") +
+    theme_minimal(base_size = 12)
+  ggsave("mc_event_study_coverage.png", p_cov, width = 8, height = 5, dpi = 300)
+  cat('Saved "mc_event_study_coverage.png"\n')
+}
+
+## 5) Console preview ----------------------------------------------------------
+print("Single-run event-study (first few rows):")
+print(head(es1, 10))
