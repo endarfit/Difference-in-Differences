@@ -1,0 +1,126 @@
+###############################################################
+# FAST & RELIABLE — HonestDiD RM Sensitivity (τ0, C-LF)
+# - Short grid (quick) -> guaranteed plot + save
+# - Optional extended grid (can be slower)
+# - Explicit print() + ggsave() with timestamps
+# Output: rm_short.png  (and optionally rm_extended.png)
+###############################################################
+
+## 0) Packages (install only if missing) --------------------------------------
+req <- c("data.table","fixest","ggplot2","broom","HonestDiD")
+new <- req[!(req %in% installed.packages()[,"Package"])]
+if (length(new)) install.packages(new, dependencies = TRUE)
+
+suppressPackageStartupMessages({
+  library(data.table); library(fixest); library(ggplot2)
+  library(broom); library(HonestDiD)
+})
+
+set.seed(12345); options(warn = 1)  # flush warnings as they happen
+cat(sprintf("[INFO] Working dir: %s\n", getwd()))
+
+## 1) Compact, high-signal DGP (quick) ----------------------------------------
+N           <- 800
+T_pre       <- 5
+T_post      <- 5
+sigma_alpha <- 1.0
+sigma_eps   <- 1.0
+trend_slope <- 0.0
+tau_const   <- 2.0
+true_tau_fun <- function(k) rep(tau_const, length(k))
+
+simulate_canonical_did <- function(N, T_pre, T_post, sigma_alpha, sigma_eps, trend_slope){
+  t_vec <- seq(-T_pre, T_post - 1); TT <- length(t_vec)
+  id <- 1:N; treated_ids <- sample(id, size = round(0.5*N), replace = FALSE)
+  alpha_i <- rnorm(N,0,sigma_alpha); lambda_t <- rnorm(TT,0,0.5) + trend_slope*t_vec
+  dt <- data.table(id = rep(id, each = TT), time = rep(t_vec, N))
+  dt[, treated := as.integer(id %in% treated_ids)]
+  dt[, alpha := alpha_i[id]]
+  dt[, lambda := lambda_t[match(time, t_vec)]]
+  dt[, event_time := time]
+  K_post <- 0:(T_post-1); tau_map <- setNames(true_tau_fun(K_post), K_post)
+  dt[, tau_true := 0]; dt[treated==1 & event_time %in% K_post, tau_true := tau_map[as.character(event_time)]]
+  dt[, eps := rnorm(.N,0,sigma_eps)]; dt[, y := alpha + lambda + tau_true + eps]
+  K_pre <- -T_pre:-2; K_all <- c(K_pre, K_post)
+  k_var <- function(k) if (k>=0) sprintf("Dk_p%d",k) else sprintf("Dk_m%d",abs(k))
+  for (k in K_all) dt[[k_var(k)]] <- as.integer(dt$treated==1 & dt$event_time==k)
+  list(dt=dt, K_pre=K_pre, K_post=K_post, K_all=K_all, k_var=k_var)
+}
+
+sim <- simulate_canonical_did(N,T_pre,T_post,sigma_alpha,sigma_eps,trend_slope)
+
+## 2) Event-study via fixest ---------------------------------------------------
+var_names <- vapply(sim$K_all, sim$k_var, character(1))
+fml <- as.formula(paste0("y ~ ", paste(var_names, collapse=" + "), " | id + time"))
+mod <- feols(fml, data = sim$dt, cluster = ~ id)
+
+betahat_all <- coef(mod); betahat <- as.numeric(betahat_all[var_names])
+V <- vcov(mod, cluster = "id"); sigma <- as.matrix(V[var_names, var_names])
+numPrePeriods <- length(sim$K_pre); numPostPeriods <- length(sim$K_post)
+l_onimpact <- HonestDiD::basisVector(index = 1, size = numPostPeriods)
+alpha_level <- 0.05
+
+## Helper to run RM once and return a plotted ggplot object --------------------
+make_rm_plot <- function(Mbarvec, file_out){
+  cat(sprintf("[INFO] RM run start (%s), grid length = %d\n", as.character(Sys.time()), length(Mbarvec)))
+  robustResults <- HonestDiD::createSensitivityResults_relativeMagnitudes(
+    betahat        = betahat,
+    sigma          = sigma,
+    numPrePeriods  = numPrePeriods,
+    numPostPeriods = numPostPeriods,
+    method         = "C-LF",
+    Mbarvec        = Mbarvec,
+    l_vec          = l_onimpact,
+    alpha          = alpha_level
+  )
+  originalResults <- HonestDiD::constructOriginalCS(
+    betahat        = betahat,
+    sigma          = sigma,
+    numPrePeriods  = numPrePeriods,
+    numPostPeriods = numPostPeriods,
+    l_vec          = l_onimpact,
+    alpha          = alpha_level
+  )
+  p <- HonestDiD::createSensitivityPlot_relativeMagnitudes(
+    robustResults   = robustResults,
+    originalResults = originalResults,
+    maxMbar         = max(Mbarvec)
+  )
+  # breakdown
+  rr <- robustResults
+  mcol <- if ("Mbar" %in% names(rr)) "Mbar" else if ("M" %in% names(rr)) "M" else "Mbar"
+  rr_clf <- rr[rr$method=="C-LF", , drop=FALSE]
+  contains_zero <- rr_clf$lb <= 0 & rr_clf$ub >= 0
+  Mbar_break <- if (any(contains_zero)) rr_clf[[mcol]][which(contains_zero)[1]] else NA_real_
+  y_top <- max(c(rr$ub, originalResults$ub), na.rm = TRUE)
+  if (is.na(Mbar_break)) {
+    p <- p + annotate("text", x = max(Mbarvec)*0.7, y = y_top,
+                      label = paste0("No breakdown up to M\u0304 = ", max(Mbarvec)),
+                      vjust = -0.5, size = 3)
+    cat(sprintf("[INFO] No breakdown within grid (max M̄ = %.2f)\n", max(Mbarvec)))
+  } else {
+    p <- p + geom_vline(xintercept = Mbar_break, linetype = "dashed") +
+      annotate("text", x = Mbar_break, y = y_top,
+               label = paste0("Breakdown M\u0304 = ", round(Mbar_break,2)),
+               vjust = -0.5, size = 3)
+    cat(sprintf("[INFO] Breakdown at M̄ = %.3f\n", Mbar_break))
+  }
+  print(p)  # ensure it shows in interactive consoles
+  ggsave(file_out, p, width = 8, height = 5, dpi = 300)
+  cat(sprintf('[INFO] Saved "%s" at %s\n', file_out, as.character(Sys.time())))
+  invisible(p)
+}
+
+## 3) QUICK RUN (short grid) — fast and should always show --------------------
+Mbar_short <- seq(0, 5, by = 0.1)
+p_short <- make_rm_plot(Mbar_short, "rm_short.png")
+
+## 4) OPTIONAL EXTENDED RUN (can be slower) -----------------------------------
+# Uncomment if you want to search for breakdown beyond 5
+# Mbar_long <- seq(0, 15, by = 0.1)
+# p_long <- make_rm_plot(Mbar_long, "rm_extended.png")
+
+## 5) Tiny sanity print --------------------------------------------------------
+pre_idx <- seq_len(numPrePeriods)
+cat(sprintf("[INFO] Max |pre ES| = %.6f ; tau_hat0 approx = %.3f\n",
+            max(abs(betahat[pre_idx])), betahat[numPrePeriods + 1]))
