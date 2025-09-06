@@ -1,0 +1,170 @@
+########################################################
+# LW-like Violation — Event-Study + Monte Carlo (SR DGP)
+# - Pre: -6:-1, Post: 0:8, ref = -1
+# - Smooth, gradual pre-trend (slope + curvature), tau ≈ 0
+# - OUTPUTS:
+#    1) ES_single_run_LW.png
+#    2) ES_monte_carlo_LW.png
+########################################################
+
+## --- 0) Packages: install & load (full header you use) ---
+req_pkgs <- c("data.table","fixest","ggplot2","remotes")
+new_pkgs <- req_pkgs[!(req_pkgs %in% installed.packages()[,"Package"])]
+if (length(new_pkgs)) install.packages(new_pkgs, dependencies = TRUE)
+
+# HonestDiD not used here, but kept for your workflow
+if (!requireNamespace("HonestDiD", quietly = TRUE)) {
+  Sys.setenv("R_REMOTES_NO_ERRORS_FROM_WARNINGS" = "true")
+  try(remotes::install_github("asheshrambachan/HonestDiD", upgrade = "never"), silent = TRUE)
+}
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(fixest)
+  library(ggplot2)
+  library(HonestDiD)
+})
+
+theme_set(theme_minimal(base_size = 13))
+
+## --- 1) DGP: LW-like smooth trend (slope + curvature) ---
+set.seed(20250822)
+
+N_treated <- 800
+N_control <- 800
+N <- N_treated + N_control
+
+t_pre  <- -6:-1
+t_post <- 0:8
+time_grid <- c(t_pre, t_post)
+ref_event <- -1
+
+# True treatment effect ~ 0 so bias drives estimates
+tau_true  <- 0.0
+
+# Smooth differential trend in Y(0): treated - control
+b_slope <- -0.25          # linear slope
+c_curv  <- -0.02          # curvature (bounded second diffs)
+delta_fun <- function(t) b_slope * t + 0.5 * c_curv * t^2
+
+# Macro/time FE volatility and id FE + noise
+sigma_eps <- 1.0
+
+## --- 2) Helpers -------------------------------------------------------------
+
+# Simulate one panel and run ES; return betas, SEs, event times
+simulate_and_fit_es <- function(seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  DT <- CJ(id = 1:N, time = time_grid)
+  DT[, treated := as.integer(id <= N_treated)]
+  DT[, rel_time := time]
+  
+  # unit FE and time FE
+  alpha_i <- rnorm(N, 0, 1)
+  DT[, alpha := alpha_i[id]]
+  lambda_t <- rnorm(length(time_grid), 0, 0.4); names(lambda_t) <- time_grid
+  DT[, lambda := lambda_t[as.character(time)]]
+  
+  # smooth differential trend
+  DT[, delta_t := delta_fun(time)]
+  
+  # treatment on after 0 for treated
+  DT[, treat_on := as.integer(time >= 0 & treated == 1)]
+  
+  # outcome
+  DT[, eps := rnorm(.N, 0, sigma_eps)]
+  DT[, y := alpha + lambda + treated * delta_t + tau_true * treat_on + eps]
+  
+  fit <- feols(y ~ i(rel_time, treated, ref = ref_event) | id + time,
+               data = DT, cluster = ~ id)
+  
+  cf <- coef(fit); nm <- names(cf)
+  keep <- grepl("^rel_time::", nm) & grepl(":treated$", nm)
+  es <- cf[keep]
+  ev <- as.integer(sub(":treated$", "", sub("^rel_time::", "", names(es))))
+  ord <- order(ev); es <- es[ord]; ev <- ev[ord]
+  
+  V <- vcov(fit, cluster = ~ id)
+  V_es <- V[names(es), names(es), drop = FALSE]
+  se <- sqrt(diag(V_es))
+  
+  list(beta = unname(es), se = unname(se), ev = ev, fit = fit)
+}
+
+# True ES path relative to -1 (τ = 0 here)
+true_es_path <- function() {
+  out <- numeric(length(time_grid[time_grid != ref_event]))
+  names(out) <- as.character(time_grid[time_grid != ref_event])
+  d_ref <- delta_fun(ref_event)
+  for (tt in as.integer(names(out))) {
+    out[as.character(tt)] <- (delta_fun(tt) - d_ref) + (if (tt >= 0) tau_true else 0)
+  }
+  out
+}
+
+## --- 3) Single-run Event-Study plot ----------------------------------------
+one <- simulate_and_fit_es()
+
+df_one <- data.table(
+  t    = c(one$ev[one$ev <= -2], ref_event, one$ev[one$ev >= 0]),
+  beta = c(one$beta[one$ev <= -2], 0,       one$beta[one$ev >= 0]),
+  se   = c(one$se[one$ev <= -2],   NA,      one$se[one$ev >= 0])
+)
+
+p_single <- ggplot(df_one, aes(t, beta)) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = beta - qnorm(0.975)*se,
+                    ymax = beta + qnorm(0.975)*se),
+                width = 0.25, na.rm = TRUE) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  geom_hline(yintercept = 0, linetype = 3) +
+  labs(x = "Event time (ref = -1)", y = "Event-study coefficient",
+       title = "LW-like DGP — Single-run Event-Study (TWFE, clustered by id)") +
+  theme_minimal()
+
+print(p_single)
+ggsave("ES_single_run_LW.png", p_single, width = 9, height = 5, dpi = 200)
+
+## --- 4) Monte Carlo ES (mean ± MC 95% band + true path) --------------------
+R <- 500   # increase for smoother bands
+set.seed(777)
+
+grid_no_ref <- time_grid[time_grid != ref_event]
+K <- length(grid_no_ref)
+mc_mat <- matrix(NA_real_, nrow = R, ncol = K, dimnames = list(NULL, as.character(grid_no_ref)))
+
+for (r in 1:R) {
+  sim <- simulate_and_fit_es()
+  est <- setNames(sim$beta, sim$ev)
+  mc_mat[r, ] <- est[colnames(mc_mat)]
+}
+
+mc_mean <- colMeans(mc_mat, na.rm = TRUE)
+mc_q025 <- apply(mc_mat, 2, quantile, probs = 0.025, na.rm = TRUE)
+mc_q975 <- apply(mc_mat, 2, quantile, probs = 0.975, na.rm = TRUE)
+truth   <- true_es_path()[colnames(mc_mat)]
+
+df_mc <- data.table(
+  t     = as.integer(colnames(mc_mat)),
+  mean  = mc_mean,
+  q025  = mc_q025,
+  q975  = mc_q975,
+  truth = as.numeric(truth)
+)
+
+p_mc <- ggplot(df_mc, aes(t, mean)) +
+  geom_ribbon(aes(ymin = q025, ymax = q975), alpha = 0.20) +
+  geom_line(size = 1) +
+  geom_line(aes(y = truth), linetype = 2) +
+  geom_hline(yintercept = 0, linetype = 3) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(x = "Event time (ref = -1)",
+       y = "Event-study coefficient",
+       title = paste0("LW-like DGP — Monte Carlo ES (R = ", R, ")"),
+       subtitle = "Solid = MC mean, Ribbon = MC 95% band, Dashed = true path") +
+  theme_minimal()
+
+print(p_mc)
+ggsave("ES_monte_carlo_LW.png", p_mc, width = 9, height = 5, dpi = 200)
+
+cat("\nSaved plots:\n - ES_single_run_LW.png\n - ES_monte_carlo_LW.png\n")
