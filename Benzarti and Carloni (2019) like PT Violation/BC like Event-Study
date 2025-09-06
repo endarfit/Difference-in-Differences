@@ -1,0 +1,195 @@
+########################################################
+# ═════════════════════════════════════════════════════
+#   🍽️ BC-like Violation — Event-Study + Monte Carlo
+# ═════════════════════════════════════════════════════
+# - Treated = "Restaurants"   Control = "Other services"
+# - Policy at event time 0; reference period = -1
+# - Mild negative pre-trend for treated (BC-like)
+# - OUTPUTS:
+#    1) Single-run event-study plot (clustered SEs)
+#    2) Monte Carlo ES plot: mean ± MC 95% band + true path
+########################################################
+
+## --- 0) Packages: install & load (complete header) ---
+req_pkgs <- c("data.table","fixest","ggplot2","remotes")
+new_pkgs <- req_pkgs[!(req_pkgs %in% installed.packages()[,"Package"])]
+if(length(new_pkgs)) install.packages(new_pkgs, dependencies = TRUE)
+
+# Install/update HonestDiD from GitHub (kept for your standard header)
+if (!requireNamespace("HonestDiD", quietly = TRUE)) {
+  Sys.setenv("R_REMOTES_NO_ERRORS_FROM_WARNINGS" = "true")
+  remotes::install_github("asheshrambachan/HonestDiD")
+}
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(fixest)
+  library(ggplot2)
+  library(HonestDiD) # not used below; included for consistency
+})
+
+theme_set(theme_minimal(base_size = 13))
+
+## --- 1) Simulation parameters (BC-like) ---
+set.seed(12345)
+
+N_treated <- 800
+N_control <- 800
+T_pre     <- 6
+T_post    <- 6
+time_grid <- -T_pre:-1
+time_grid <- c(time_grid, 0:(T_post-1))   # event-time vector
+ref_event <- -1
+
+# True post ATT path (profits-like ↑ after policy)
+tau_post <- seq(0.06, 0.12, length.out = T_post)   # log points
+
+# BC-like bias in Y(0): mild negative trend for treated
+slope_pre  <- -0.010   # per pre period
+slope_post <- -0.012   # per post period
+
+# Build δ_t with δ_{-1} = 0 and linear drifts
+delta_vec <- numeric(length(time_grid)); names(delta_vec) <- as.character(time_grid)
+for (tt in rev(time_grid[time_grid <= -1])) {
+  if (tt == -1) delta_vec[as.character(tt)] <- 0
+  else delta_vec[as.character(tt)] <- delta_vec[as.character(tt + 1)] - slope_pre
+}
+for (tt in time_grid[time_grid >= 0]) {
+  prev <- if (tt == 0) -1 else tt - 1
+  delta_vec[as.character(tt)] <- delta_vec[as.character(prev)] + slope_post
+}
+
+# Common macro trend
+gamma_t <- 0.02 * time_grid; names(gamma_t) <- as.character(time_grid)
+
+# Noise
+sigma_eps <- 0.08
+
+## --- 2) Helpers -------------------------------------------------------------
+
+# Simulate one panel draw and fit ES; return betas, SEs, and event times
+simulate_and_fit_es <- function(seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  N <- N_treated + N_control
+  ids <- 1:N
+  treated_ids <- 1:N_treated
+  
+  DT <- CJ(id = ids, time = time_grid)
+  DT[, treated := as.integer(id %in% treated_ids)]
+  DT[, rel_time := time]
+  
+  alpha_i <- rnorm(N, 0, 0.5)
+  DT[, alpha := alpha_i[id]]
+  DT[, gamma := gamma_t[as.character(time)]]
+  DT[, delta := ifelse(treated == 1, delta_vec[as.character(time)], 0)]
+  
+  DT[, D := as.integer(treated == 1 & time >= 0)]
+  tau_map <- tau_post; names(tau_map) <- as.character(0:(T_post-1))
+  DT[, tau := 0]; DT[time >= 0, tau := tau_map[as.character(time)]]
+  
+  DT[, eps := rnorm(.N, 0, sigma_eps)]
+  DT[, y := alpha + gamma + delta + D * tau + eps]
+  
+  fit <- feols(y ~ i(rel_time, treated, ref = ref_event) | id + time,
+               data = DT, cluster = ~ id)
+  
+  # extract ES terms in increasing event-time order
+  all_coef <- coef(fit); nm <- names(all_coef)
+  keep <- grepl("^rel_time::", nm) & grepl(":treated$", nm)
+  es <- all_coef[keep]
+  ev <- sub("^rel_time::", "", names(es)); ev <- as.integer(sub(":treated$", "", ev))
+  ord <- order(ev); es <- es[ord]; ev <- ev[ord]
+  
+  V <- vcov(fit, cluster = ~ id)
+  V_es <- V[names(es), names(es), drop = FALSE]
+  se <- sqrt(diag(V_es))
+  
+  list(beta = unname(es), se = unname(se), ev = ev, fit = fit)
+}
+
+# True event-study path relative to -1 (for overlay in MC plot)
+true_es_path <- function() {
+  out <- numeric(length(time_grid[time_grid != ref_event]))
+  names(out) <- as.character(time_grid[time_grid != ref_event])
+  for (tt in as.integer(names(out))) {
+    if (tt <= -2) {
+      out[as.character(tt)] <- delta_vec[as.character(tt)] - delta_vec[as.character(ref_event)]
+    } else if (tt >= 0) {
+      tau_t <- tau_post[tt + 1]  # since post times are 0...(T_post-1)
+      out[as.character(tt)] <- (delta_vec[as.character(tt)] + tau_t) - delta_vec[as.character(ref_event)]
+    }
+  }
+  out
+}
+
+## --- 3) Single-run Event-Study plot ----------------------------------------
+one <- simulate_and_fit_es()
+
+df_one <- data.table(
+  t = c(one$ev[one$ev <= -2], ref_event, one$ev[one$ev >= 0]),
+  beta = c(one$beta[one$ev <= -2], 0, one$beta[one$ev >= 0]),
+  se   = c(one$se[one$ev <= -2], NA, one$se[one$ev >= 0])
+)
+
+p_single <- ggplot(df_one, aes(t, beta)) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = beta - qnorm(0.975)*se,
+                    ymax = beta + qnorm(0.975)*se),
+                width = 0.25, na.rm = TRUE) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  geom_hline(yintercept = 0, linetype = 3) +
+  labs(x = "Event time (ref = -1)", y = "Event-study coefficient",
+       title = "Single-run Event-Study (2WFE; clustered by id)") +
+  theme_minimal()
+
+print(p_single)
+ggsave("ES_single_run.png", p_single, width = 9, height = 5, dpi = 200)
+
+## --- 4) Monte Carlo over ES coefficients -----------------------------------
+R <- 500   # increase if you want tighter MC bands
+set.seed(777)
+
+# Collect ES estimates on the common event-time grid (drop ref -1)
+grid_no_ref <- time_grid[time_grid != ref_event]
+K <- length(grid_no_ref)
+mc_mat <- matrix(NA_real_, nrow = R, ncol = K)
+colnames(mc_mat) <- as.character(grid_no_ref)
+
+for (r in 1:R) {
+  sim <- simulate_and_fit_es()
+  # map estimates to grid (pre<=-2 and post>=0 exist by design)
+  est <- setNames(sim$beta, sim$ev)
+  mc_mat[r, ] <- est[colnames(mc_mat)]
+}
+
+# MC summaries
+mc_mean <- colMeans(mc_mat, na.rm = TRUE)
+mc_q025 <- apply(mc_mat, 2, quantile, probs = 0.025, na.rm = TRUE)
+mc_q975 <- apply(mc_mat, 2, quantile, probs = 0.975, na.rm = TRUE)
+
+truth <- true_es_path()[colnames(mc_mat)]
+
+df_mc <- data.table(
+  t = as.integer(colnames(mc_mat)),
+  mean = mc_mean,
+  q025 = mc_q025,
+  q975 = mc_q975,
+  truth = as.numeric(truth)
+)
+
+p_mc <- ggplot(df_mc, aes(t, mean)) +
+  geom_ribbon(aes(ymin = q025, ymax = q975), alpha = 0.20) +
+  geom_line(size = 1) +
+  geom_line(aes(y = truth), linetype = 2) +
+  geom_hline(yintercept = 0, linetype = 3) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(x = "Event time (ref = -1)",
+       y = "Event-study coefficient",
+       title = paste0("Monte Carlo Event-Study (R = ", R, "): mean ± MC 95% band"),
+       subtitle = "Dashed line = true ES path") +
+  theme_minimal()
+
+print(p_mc)
+ggsave("ES_monte_carlo.png", p_mc, width = 9, height = 5, dpi = 200)
+
+cat("\nSaved plots:\n - ES_single_run.png\n - ES_monte_carlo.png\n")
