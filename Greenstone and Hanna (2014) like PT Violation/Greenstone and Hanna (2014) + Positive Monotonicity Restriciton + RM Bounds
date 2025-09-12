@@ -1,169 +1,232 @@
 ############################################################
-# HonestDiD-style Hybrid vs OLS plot (single panel)
-# Greenstone & Hanna–like PT violation
-# Restrictions: Monotonicity + Post-sign + RM(level)
+# HonestDiD plots — RM + (Polyhedral OR LP fallback)
+# Works even when createSensitivityResults_polyhedral is NOT exported
 ############################################################
 
 ## 0) Packages
-req <- c("fixest","data.table","ggplot2","Matrix","broom","lpSolve","remotes")
-new <- req[!(req %in% installed.packages()[,"Package"])]
-if(length(new)) install.packages(new, dependencies = TRUE)
-
-if (!requireNamespace("HonestDiD", quietly = TRUE)) {
-  remotes::install_github("asheshrambachan/HonestDiD", force = TRUE)
-}
+req_pkgs <- c("fixest","data.table","ggplot2","Matrix","broom","lpSolve","HonestDiD")
+new_pkgs <- req_pkgs[!(req_pkgs %in% installed.packages()[,"Package"])]
+if (length(new_pkgs)) install.packages(new_pkgs, dependencies = TRUE)
 
 suppressPackageStartupMessages({
-  library(fixest); library(data.table); library(ggplot2)
-  library(Matrix); library(broom); library(lpSolve)
-  ok_HD <- requireNamespace("HonestDiD", quietly = TRUE)
-  if (ok_HD) library(HonestDiD)
+  library(fixest)
+  library(data.table)
+  library(ggplot2)
+  library(Matrix)
+  library(broom)
+  library(lpSolve)
+  library(HonestDiD)
 })
 
 set.seed(12345)
+out_dir   <- getwd()
+out_stub  <- "Honest_MonoUp"
+alpha_lvl <- 0.05
 
-## 1) DGP
-N_treat <- 140; N_control <- 140; N <- N_treat + N_control
-preT <- 5; postT <- 6
-ev_times <- -preT:postT
+## 1) DGP — your exact knobs
+N_treat <- 120; N_control <- 120; N <- N_treat + N_control
+preT <- 5; postT <- 6; ev_times <- -preT:postT
+tau_true <- -0.35; delta_slope <- 0.08; g_slope <- 0.05
+sigma_eps <- 0.4; sd_alpha <- 0.6
+target_et <- 2L                       # choose from {0,1,2,3,4,5}
+M_grid    <- seq(0, 2, length.out = 41)
 
-DT <- CJ(id = 1:N, t = ev_times)
-DT[, treat := as.integer(id <= N_treat)]
-DT[, ai := rnorm(N, 0, 0.6)[id]]
-DT[, g_t := 0.03 * t]
-
-delta_fun <- function(tt) 0.18 * (tt + preT) # monotone upward bias
-DT[, delta_bias := ifelse(treat==1, delta_fun(t), 0)]
-
-tau_true <- -0.35
-DT[, tau_it := ifelse(treat==1 & t>=0, tau_true, 0)]
-DT[, eps := rnorm(.N, 0, 0.45)]
-DT[, Y := ai + g_t + delta_bias + tau_it + eps]
-
-## 2) Event study
-es_fit <- feols(Y ~ i(t, treat, ref = -1) | id + t, data = DT)
-all_times <- setdiff(ev_times, -1)
-cn <- paste0("t::", all_times, ":treat")
-cn <- cn[cn %in% names(es_fit$coefficients)]
-
-betahat <- as.numeric(es_fit$coefficients[cn]); names(betahat) <- cn
-Sigma   <- as.matrix(vcov(es_fit, se = "hetero")[cn, cn, drop=FALSE])
-
-pre_idx  <- which(all_times < 0)
-post_idx <- which(all_times >= 0)
-betahat_pre   <- betahat[pre_idx]
-betahat_post  <- betahat[post_idx]
-Sigma_pre     <- Sigma[pre_idx,  pre_idx,  drop=FALSE]
-Sigma_post    <- Sigma[post_idx, post_idx, drop=FALSE]
-Sigma_pp      <- Sigma[pre_idx,  post_idx, drop=FALSE]
-Sigma_ppt     <- t(Sigma_pp)
-
-numPre  <- length(pre_idx)
-numPost <- length(post_idx)
-pre_times  <- sort(all_times[pre_idx])
-post_times <- sort(all_times[post_idx])
-Ttot <- numPre + numPost
-
-## 3) Constraints: monotonicity + sign + anchor + box + RM(level)
-pos <- function(tt) if (tt < 0) which(pre_times == tt) else numPre + which(post_times == tt)
-
-build_base <- function(Bbox = 25) {
-  A <- list(); d <- list()
-  ord <- c(pre_times, post_times)
-  for (k in 1:(length(ord)-1)) {
-    i1 <- pos(ord[k]); i2 <- pos(ord[k+1])
-    a <- rep(0, Ttot); a[i2] <- -1; a[i1] <- +1
-    A[[length(A)+1]] <- a; d[[length(d)+1]] <- 0
-  }
-  j <- pos(max(pre_times)); a <- rep(0, Ttot); a[j] <- +1
-  A[[length(A)+1]] <- a; d[[length(d)+1]] <- 0
-  for (tt in post_times) { i <- pos(tt); a <- rep(0, Ttot); a[i] <- -1
-  A[[length(A)+1]] <- a; d[[length(d)+1]] <- 0 }
-  for (j in seq_len(Ttot)) {
-    a <- rep(0, Ttot); a[j] <- +1; A[[length(A)+1]] <- a; d[[length(d)+1]] <- Bbox
-    a <- rep(0, Ttot); a[j] <- -1; A[[length(A)+1]] <- a; d[[length(d)+1]] <- Bbox
-  }
-  list(A = do.call(rbind, A), d = unlist(d))
+simulate_panel <- function() {
+  DT <- CJ(id = 1:N, t = ev_times)
+  DT[, treat := as.integer(id <= N_treat)]
+  DT[, rel_time := t]
+  alpha_i <- rnorm(N, 0, sd_alpha)
+  DT[, ai := alpha_i[id]]
+  DT[, g_t := g_slope * t]
+  delta_fun <- function(tt) delta_slope * (tt + preT)
+  DT[, delta_bias := ifelse(treat==1, delta_fun(t), 0)]
+  DT[, tau_it := ifelse(treat==1 & t>=0, tau_true, 0)]
+  DT[, eps := rnorm(.N, 0, sigma_eps)]
+  DT[, Y := ai + g_t + delta_bias + tau_it + eps]
+  DT[, time := t]
+  DT[]
 }
 
-add_RM_level_caps <- function(A, d, Mbar) {
-  max_pre_level_abs <- suppressWarnings(max(abs(as.numeric(betahat_pre)), na.rm = TRUE))
-  if (!is.finite(max_pre_level_abs) || max_pre_level_abs <= 0) max_pre_level_abs <- 0.05
-  cap <- Mbar * max_pre_level_abs
-  B <- list(); e <- list()
-  for (tt in post_times) {
-    i <- pos(tt)
-    a <- rep(0, Ttot); a[i] <- +1; B[[length(B)+1]] <- a; e[[length(e)+1]] <- cap
-  }
-  list(A = rbind(A, do.call(rbind, B)), d = c(d, unlist(e)))
+## 2) ES once (inputs for HonestDiD)
+DT1 <- simulate_panel()
+es_fit <- feols(Y ~ i(rel_time, treat, ref = -1) | id + time, data = DT1, cluster = ~id)
+
+all_times  <- setdiff(ev_times, -1)
+pre_times  <- sort(all_times[all_times <  0])
+post_times <- sort(all_times[all_times >= 0])
+stopifnot(target_et %in% post_times)
+
+V <- vcov(es_fit, se = "cluster")
+
+beta_pre   <- as.numeric(coef(es_fit)[paste0("rel_time::", pre_times,  ":treat")])
+beta_post  <- as.numeric(coef(es_fit)[paste0("rel_time::", post_times, ":treat")])
+names(beta_pre)  <- paste0("rel_time::", pre_times,  ":treat")
+names(beta_post) <- paste0("rel_time::", post_times, ":treat")
+
+Sigma_pre  <- as.matrix(V[names(beta_pre),  names(beta_pre),  drop=FALSE])
+Sigma_pp   <- as.matrix(V[names(beta_pre),  names(beta_post), drop=FALSE])
+Sigma_ppt  <- t(Sigma_pp)
+Sigma_post <- as.matrix(V[names(beta_post), names(beta_post), drop=FALSE])
+
+betahat <- c(beta_pre, beta_post)
+Sigma   <- rbind(cbind(Sigma_pre, Sigma_pp),
+                 cbind(Sigma_ppt, Sigma_post))
+numPre  <- length(pre_times)
+numPost <- length(post_times)
+l_vec   <- as.numeric(post_times == target_et)
+
+## 3) RM sensitivity — compute AND plot manually (robust to version)
+rm_results <- try(
+  HonestDiD::createSensitivityResults_relativeMagnitudes(
+    betahat       = betahat,
+    sigma         = Sigma,
+    numPrePeriods = numPre,
+    numPostPeriods= numPost,
+    Mvec          = M_grid,
+    l_vec         = l_vec,
+    alpha         = alpha_lvl
+  ), silent = TRUE)
+
+if (inherits(rm_results, "try-error")) {
+  rm_results <- HonestDiD::createSensitivityResults_relativeMagnitudes(
+    betahat       = betahat,
+    sigma         = Sigma,
+    numPrePeriods = numPre,
+    numPostPeriods= numPost,
+    Mbarvec       = M_grid,
+    l_vec         = l_vec,
+    alpha         = alpha_lvl
+  )
 }
 
-## 4) Target: ATT at t = +2
-l_vec <- as.numeric(post_times == 2L)
+rm_df <- as.data.frame(rm_results)
+nm <- names(rm_df)
+M_col   <- if ("Mbar" %in% nm) "Mbar" else if ("M" %in% nm) "M" else if ("Mvec" %in% nm) "Mvec" else stop("RM: M column not found.")
+cil_col <- if ("cil"  %in% nm) "cil"  else if ("ci_lower" %in% nm) "ci_lower" else if ("lb" %in% nm) "lb" else stop("RM: lower CI column not found.")
+ciu_col <- if ("ciu"  %in% nm) "ciu"  else if ("ci_upper" %in% nm) "ci_upper" else if ("ub" %in% nm) "ub" else stop("RM: upper CI column not found.")
 
-ols_ci <- function(l_vec){
-  est <- sum(l_vec * betahat_post)
-  v   <- as.numeric(t(l_vec) %*% Sigma_post %*% l_vec)
-  se  <- sqrt(max(v,0))
-  c(est - 1.96*se, est + 1.96*se)
-}
-ols_bounds <- ols_ci(l_vec)
+theta_hat <- as.numeric(beta_post[post_times == target_et])
 
-## 5) Compute Hybrid CS across Mbar
-base <- build_base()
-Mgrid <- c(0.5, 1.0, 1.5, 2.0)
+rm_df$covers0 <- (rm_df[[cil_col]] <= 0) & (rm_df[[ciu_col]] >= 0)
+M_break <- if (any(rm_df$covers0, na.rm = TRUE)) min(rm_df[[M_col]][rm_df$covers0], na.rm = TRUE) else NA_real_
 
-use_poly <- ok_HD && ("createSensitivityResults_polyhedral" %in% getNamespaceExports("HonestDiD"))
-
-compute_CS <- function(l_vec, A, d) {
-  if (use_poly) {
-    beta_full <- c(betahat_pre[order(pre_times)], betahat_post[order(post_times)])
-    Sigma_full <- rbind(
-      cbind(Sigma_pre[order(pre_times),  order(pre_times),  drop=FALSE],
-            Sigma_pp [order(pre_times),  order(post_times), drop=FALSE]),
-      cbind(Sigma_ppt[order(post_times), order(pre_times),  drop=FALSE],
-            Sigma_post[order(post_times), order(post_times), drop=FALSE])
-    )
-    out <- HonestDiD::createSensitivityResults_polyhedral(
-      betahat = beta_full, sigma = Sigma_full,
-      numPrePeriods = numPre, numPostPeriods = numPost,
-      l_vec = l_vec, A = A, d = d,
-      alpha = 0.05, hybrid_flag = TRUE
-    )
-    unname(out$Confidence.Set)
-  } else {
-    # LP fallback
-    cvec <- c(rep(0, numPre), l_vec)
-    smax <- lp("max", cvec, A, rep("<=", nrow(A)), d)
-    smin <- lp("min", cvec, A, rep("<=", nrow(A)), d)
-    theta_hat <- sum(l_vec * betahat_post)
-    c(theta_hat - smax$objval, theta_hat - smin$objval)
-  }
-}
-
-rows <- lapply(Mgrid, function(M){
-  Om <- add_RM_level_caps(base$A, base$d, M)
-  cs <- compute_CS(l_vec, Om$A, Om$d)
-  data.frame(Mbar = M, LB = cs[1], UB = cs[2])
-})
-df <- do.call(rbind, rows)
-
-## 6) Plot (RR style, single panel)
-x_ols <- min(Mgrid) - 0.25
-p <- ggplot() +
-  geom_linerange(data = df, aes(x = Mbar, ymin = LB, ymax = UB, color = "Hybrid"), linewidth = 1.1) +
-  geom_linerange(data = data.frame(Mbar = x_ols, LB = ols_bounds[1], UB = ols_bounds[2]),
-                 aes(x = Mbar, ymin = LB, ymax = UB, color = "OLS"), linewidth = 1.1) +
+p_rm <- ggplot(rm_df, aes(x = .data[[M_col]])) +
+  geom_linerange(aes(ymin = .data[[cil_col]], ymax = .data[[ciu_col]]), linewidth = 0.9, color = "red") +
+  geom_point(data = data.frame(M0 = 0, theta = theta_hat),
+             aes(x = M0, y = theta), color = "blue", size = 2) +
   geom_hline(yintercept = 0, linewidth = 0.4) +
-  scale_color_manual(values = c("Hybrid"="#E41A1C","OLS"="#1F9AFE")) +
-  scale_x_continuous(breaks = c(x_ols, Mgrid), labels = c(" ", Mgrid)) +
-  labs(title = expression(paste("Sensitivity: ", theta," = ", tau["+2"])),
-       x = expression(bar(M)), y = NULL, color = NULL) +
-  theme_minimal(base_size = 14) +
-  theme(legend.position = "bottom", plot.title = element_text(hjust = 0.5))
-print(p)
+  { if (!is.na(M_break)) geom_vline(xintercept = M_break, linetype = "dashed") } +
+  labs(title = paste0("HonestDiD RM sensitivity at k = ", target_et),
+       x = expression(bar(M)), y = NULL) +
+  theme_minimal(base_size = 12)
 
-## 7) Breakdown value (smallest M where CI covers 0)
-df$contains_zero <- (df$LB <= 0 & df$UB >= 0)
-breakdown <- min(df$Mbar[df$contains_zero])
-cat("Breakdown value Mbar ≈", breakdown, "\n")
+## 4) Monotone ↑ + Post-Sign interval
+## Try HonestDiD polyhedral if available; otherwise LP partial-ID fallback
+has_poly <- "createSensitivityResults_polyhedral" %in% getNamespaceExports("HonestDiD")
+
+if (has_poly) {
+  poly_res <- HonestDiD::createSensitivityResults_polyhedral(
+    betahat       = betahat,
+    sigma         = Sigma,
+    numPrePeriods = numPre,
+    numPostPeriods= numPost,
+    l_vec         = l_vec,
+    A             = {
+      # build constraints A delta <= d
+      build_constraints <- function(pre_times, post_times) {
+        numPre  <- length(pre_times); numPost <- length(post_times); Ttot <- numPre + numPost
+        map_pos <- function(tt) if (tt < 0) which(pre_times == tt) else numPre + which(post_times == tt)
+        A_list <- list(); d_list <- list()
+        all_ord <- c(pre_times, post_times)
+        if (length(all_ord) >= 2) {
+          for (k in 1:(length(all_ord)-1)) {
+            i1 <- map_pos(all_ord[k]); i2 <- map_pos(all_ord[k+1])
+            a <- rep(0, Ttot); a[i2] <- -1; a[i1] <- +1
+            A_list[[length(A_list)+1]] <- a; d_list[[length(d_list)+1]] <- 0
+          }
+        }
+        if (numPre > 0) { j <- map_pos(max(pre_times)); a <- rep(0, Ttot); a[j] <- +1
+        A_list[[length(A_list)+1]] <- a; d_list[[length(d_list)+1]] <- 0 }
+        for (tt in post_times) { i <- map_pos(tt); a <- rep(0, Ttot); a[i] <- -1
+        A_list[[length(A_list)+1]] <- a; d_list[[length(d_list)+1]] <- 0 }
+        assign(".d_vec", as.numeric(do.call(c, d_list)), envir = .GlobalEnv)
+        do.call(rbind, A_list)
+      }
+      build_constraints(pre_times, post_times)
+    },
+    d             = get(".d_vec", envir = .GlobalEnv),
+    alpha         = alpha_lvl,
+    hybrid_flag   = TRUE
+  )
+  ci_poly <- poly_res$Confidence.Set
+  lb <- ci_poly[1,1]; ub <- ci_poly[1,2]
+  poly_title <- paste0("Polyhedral CI — Monotone (↑) + Post-Sign at k = ", target_et)
+  note_str  <- NULL
+} else {
+  ## Fallback: LP identified set for bias under same constraints (no sampling)
+  pre_sorted  <- pre_times; post_sorted <- post_times
+  numPre  <- length(pre_sorted); numPost <- length(post_sorted); Ttot <- numPre + numPost
+  map_pos <- function(tt) if (tt < 0) which(pre_sorted == tt) else numPre + which(post_sorted == tt)
+  
+  A_list <- list(); d_list <- list()
+  all_ord <- c(pre_sorted, post_sorted)
+  if (length(all_ord) >= 2) {
+    for (k in 1:(length(all_ord)-1)) {
+      i1 <- map_pos(all_ord[k]); i2 <- map_pos(all_ord[k+1])
+      a <- rep(0, Ttot); a[i2] <- -1; a[i1] <- +1
+      A_list[[length(A_list)+1]] <- a; d_list[[length(d_list)+1]] <- 0
+    }
+  }
+  if (numPre > 0) { j <- map_pos(max(pre_sorted)); a <- rep(0, Ttot); a[j] <- +1
+  A_list[[length(A_list)+1]] <- a; d_list[[length(d_list)+1]] <- 0 }
+  for (tt in post_sorted) { i <- map_pos(tt); a <- rep(0, Ttot); a[i] <- -1
+  A_list[[length(A_list)+1]] <- a; d_list[[length(d_list)+1]] <- 0 }
+  
+  # numeric box to ensure boundedness (doesn't bind under reasonable ranges)
+  Bbox <- 10
+  for (j in seq_len(Ttot)) {
+    a <- rep(0, Ttot); a[j] <- +1;  A_list[[length(A_list)+1]] <- a; d_list[[length(d_list)+1]] <- Bbox
+    a <- rep(0, Ttot); a[j] <- -1; A_list[[length(A_list)+1]] <- a; d_list[[length(d_list)+1]] <- Bbox
+  }
+  A <- do.call(rbind, A_list); d <- as.numeric(do.call(c, d_list))
+  
+  # Objective extracts target_post bias: c'δ with c selecting target_et among post
+  cvec <- c(rep(0, numPre), as.numeric(post_sorted == target_et))
+  
+  feas <- lp("min", objective.in = rep(0, Ttot), const.mat = A, const.dir = rep("<=", nrow(A)), const.rhs = d)
+  if (feas$status != 0) stop("Constraint set infeasible.")
+  sol_max <- lp("max", objective.in = cvec, const.mat = A, const.dir = rep("<=", nrow(A)), const.rhs = d)
+  sol_min <- lp("min", objective.in = cvec, const.mat = A, const.dir = rep("<=", nrow(A)), const.rhs = d)
+  if (sol_max$status != 0 || sol_min$status != 0) stop("LP failed/unbounded; increase Bbox.")
+  bmax <- sol_max$objval; bmin <- sol_min$objval
+  
+  theta_hat <- as.numeric(beta_post[post_sorted == target_et])
+  lb <- theta_hat - bmax
+  ub <- theta_hat - bmin
+  poly_title <- paste0("Identified Set (LP) — Monotone (↑) + Post-Sign at k = ", target_et)
+  note_str  <- "Note: LP partial-ID set (no sampling)."
+}
+
+poly_df <- data.frame(x = 0, y = (lb + ub)/2, ymin = lb, ymax = ub)
+p_poly <- ggplot(poly_df, aes(x = x, y = y, ymin = ymin, ymax = ymax)) +
+  geom_hline(yintercept = 0, linewidth = 0.4) +
+  geom_errorbar(width = 0.06, color = "red", linewidth = 0.9) +
+  geom_point(color = "red", size = 1.8) +
+  scale_x_continuous(breaks = NULL) +
+  labs(title = poly_title, subtitle = note_str, x = NULL, y = NULL) +
+  theme_minimal(base_size = 12)
+
+## 5) Save + PRINT
+file_rm   <- normalizePath(file.path(out_dir, paste0(out_stub, "_RM_k", target_et, ".png")), mustWork = FALSE)
+file_poly <- normalizePath(file.path(out_dir, paste0(out_stub, if (has_poly) "_Poly_MonoSign_k" else "_LP_MonoSign_k", target_et, ".png")), mustWork = FALSE)
+
+ggsave(file_rm,   p_rm,   width = 9.5, height = 6.0, dpi = 300)
+ggsave(file_poly, p_poly, width = 7.2, height = 4.2, dpi = 300)
+
+print(p_rm)
+print(p_poly)
+
+cat("\n==== HonestDiD (robust code) ====\n")
+if (!is.na(M_break)) cat(sprintf("Breakdown Mbar ≈ %.3f\n", M_break))
+cat(sprintf("%s interval: [%.3f, %.3f]\n", if (has_poly) "Polyhedral" else "LP partial-ID", lb, ub))
+cat("Saved:\n  - ", file_rm, "\n  - ", file_poly, "\n", sep = "")
