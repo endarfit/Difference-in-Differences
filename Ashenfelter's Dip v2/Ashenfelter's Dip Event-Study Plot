@@ -1,0 +1,174 @@
+###############################################################
+# Monte Carlo Event-Study (R = 500) for Ashenfelter’s Dip
+# - Dip at t = -1
+# - Miller (2023) Fix A: reference = -4:-2 (exclude -1)
+# - Event-study via fixest: y ~ i(event_time, treated, ref = ref_win) | id + time
+# - Output: pointwise MC mean + 95% pointwise band + true path overlay
+###############################################################
+
+## 0) Packages: install & robustly load
+cran_repo <- getOption("repos")
+if (is.null(cran_repo) || is.na(cran_repo) || cran_repo["CRAN"] == "@CRAN@") {
+  options(repos = c(CRAN = "https://cloud.r-project.org"))
+}
+
+req_pkgs <- c("data.table","fixest","broom","ggplot2")
+to_install <- req_pkgs[!(req_pkgs %in% rownames(installed.packages()))]
+if (length(to_install)) {
+  install.packages(to_install, dependencies = TRUE)
+}
+
+# second-chance install if any failed
+still_missing <- req_pkgs[!(req_pkgs %in% rownames(installed.packages()))]
+if (length(still_missing)) {
+  warning("Retrying installation for: ", paste(still_missing, collapse = ", "))
+  install.packages(still_missing, dependencies = TRUE)
+}
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(fixest)
+  library(broom)
+  library(ggplot2)
+})
+
+set.seed(12345)
+
+## 1) Global design: Ashenfelter’s Dip
+TT_pre   <- 5          # event times: -5, -4, -3, -2, -1
+TT_post  <- 5          # event times:  0,  1,  2,  3,  4
+t_grid   <- -TT_pre:(TT_post - 1)   # -5 .. 4
+N_treat  <- 100
+N_ctrl   <- 100
+N        <- N_treat + N_ctrl
+treat_start <- 0
+
+# Miller (2023) Fix A: exclude -1 from reference set
+ref_win <- c(-4, -3, -2)
+
+# True treatment path (for overlay)
+tau_val <- 0.6
+dip_mag <- -1.8
+true_path <- data.table(
+  event_time = t_grid,
+  true_tau   = c(rep(0, TT_pre - 1), dip_mag, rep(tau_val, TT_post))
+)
+
+## 2) Helper: AR(1) generator (numeric, no 'ts' objects)
+sim_ar1_numeric <- function(Tlen, rho = 0.3, sigma = 1) {
+  e <- rnorm(Tlen, 0, sigma); x <- numeric(Tlen)
+  x[1] <- e[1] / sqrt(1 - rho^2)
+  for (t in 2:Tlen) x[t] <- rho * x[t-1] + e[t]
+  x
+}
+
+## 3) One simulation: generate data, run ES, return named vector of ES coefs by k
+one_sim <- function() {
+  DT <- CJ(id = 1:N, time = t_grid)
+  DT[, treated := (id <= N_treat)]
+  
+  # Unit FE and common time trend
+  alpha_i <- rnorm(N, 0, 1)
+  DT[, fe_i := alpha_i[id]]
+  DT[, fe_t := 0.10 * time]
+  
+  # AR(1) noise per unit
+  DT[, eps := sim_ar1_numeric(length(t_grid)), by = id]
+  
+  # Treatment and dip
+  DT[, post := as.integer(time >= treat_start)]
+  DT[, te   := ifelse(treated & post == 1, tau_val, 0)]
+  DT[, dip  := ifelse(treated & time == -1, dip_mag, 0)]
+  
+  # Outcome and event time (required name)
+  DT[, y := fe_i + fe_t + eps + te + dip]
+  DT[, event_time := time - treat_start]
+  
+  # Event-study with Miller Fix A reference
+  es_fit <- feols(
+    y ~ i(event_time, treated, ref = ref_win) | id + time,
+    data = DT
+  )
+  
+  # Extract coefficients by event-time k (robust to fixest naming)
+  co <- broom::tidy(es_fit)
+  get_k <- function(term) {
+    pats <- c("^event_time::(-?\\d+):treated$",
+              "^i\\(event_time,\\s*treated[^)]*\\)::(-?\\d+)$",
+              "^.*::(-?\\d+):treated$")
+    for (p in pats) {
+      m <- regexec(p, term); r <- regmatches(term, m)[[1]]
+      if (length(r) >= 2 && !is.na(r[2])) return(as.integer(r[2]))
+    }
+    NA_integer_
+  }
+  co$k <- vapply(co$term, get_k, 1L)
+  co   <- co[!is.na(co$k), c("k","estimate")]
+  
+  # Build full vector for all k in t_grid, with 0 at reference (by construction)
+  est_vec <- setNames(rep(NA_real_, length(t_grid)), t_grid)
+  est_vec[as.character(ref_win)] <- 0
+  if (nrow(co)) {
+    est_vec[as.character(co$k)] <- co$estimate
+  }
+  est_vec
+}
+
+## 4) Monte Carlo loop (R = 500)
+R <- 500
+all_ks <- t_grid
+store <- matrix(NA_real_, nrow = R, ncol = length(all_ks))
+colnames(store) <- as.character(all_ks)
+
+# Simple text progress bar
+if (interactive()) pb <- txtProgressBar(min = 0, max = R, style = 3)
+for (r in 1:R) {
+  store[r, ] <- one_sim()
+  if (exists("pb")) setTxtProgressBar(pb, r)
+}
+if (exists("pb")) close(pb)
+
+## 5) MC summary: mean and 95% pointwise band (2.5% & 97.5% quantiles)
+summ <- data.table(
+  event_time = all_ks,
+  mean  = apply(store, 2, function(x) mean(x, na.rm = TRUE)),
+  low   = apply(store, 2, function(x) quantile(x, 0.025, na.rm = TRUE)),
+  high  = apply(store, 2, function(x) quantile(x, 0.975, na.rm = TRUE))
+)
+
+# Ensure reference window exactly at zero (cosmetic)
+summ[event_time %in% ref_win, `:=`(mean = 0, low = 0, high = 0)]
+
+## 6) Plot: MC mean with 95% band + true path
+p_es <- ggplot(summ, aes(x = event_time, y = mean)) +
+  # Shaded reference window
+  annotate("rect",
+           xmin = min(ref_win) - 0.5, xmax = max(ref_win) + 0.5,
+           ymin = -Inf, ymax = Inf, alpha = 0.08) +
+  # 95% MC band
+  geom_ribbon(aes(ymin = low, ymax = high), alpha = 0.2) +
+  # MC mean
+  geom_line(size = 1) +
+  # True path (dashed)
+  geom_line(data = true_path, aes(x = event_time, y = true_tau),
+            linetype = "dashed") +
+  # Zero and treatment demarcation
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = -0.5, linetype = "dotted") +  # treatment starts at k = 0
+  scale_x_continuous(breaks = all_ks) +
+  labs(
+    title = "Monte Carlo Event-Study (R = 500): Ashenfelter’s Dip",
+    subtitle = "Reference (k = −4:−2) shaded. Dashed = true path; solid = MC mean; band = 95% pointwise.",
+    x = "Event time k", y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+print(p_es)
+
+###############################################################
+# Notes:
+# • Bands are pointwise 2.5%–97.5% quantiles across replications (not simultaneous).
+# • Reference window is normalized to 0 by construction and plotted as zero.
+# • True path: dip at k = -1 (−1.8), constant post-effect 0.6.
+###############################################################
