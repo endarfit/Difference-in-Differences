@@ -1,6 +1,6 @@
 # Difference-in-Differences under Non-Parallel Trends  
 _A Master’s Thesis Project_  
-by endarfit (Kağan Eskicioğlu)  
+by Kağan Eskicioğlu
 M.Sc. Economics, University of Bonn
 
 ## 📖 Project Overview  
@@ -57,7 +57,7 @@ The choice of bound type (RM vs SM) depends on the nature of violation, research
 
 🤝 Citation & License
 If you use or adapt this code in your work, please cite the repository and mention the original thesis.
-License: MIT License (see LICENSE file).
+License: MIT License 
 
 ✉️ Contact
 For questions, suggestions, or collaborations, feel free to contact me:
