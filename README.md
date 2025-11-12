@@ -24,8 +24,6 @@ The work uses the R programming language and focuses on reproducibility and clea
 /Monte Carlo Simulation: Non-Robust ATT Estimation under Smooth Group-Specific Pre-Trends (Relative Magnitude Bounds)/
 /Smoothness Restriction on Group-Specific Trends ATT Estimates/
 
-markdown
-Kodu kopyala
 Each folder corresponds to a specific simulation design or empirical case study and contains:  
 - R scripts (.R) for data generation, estimation, bounding, and graphics  
 - A README or script header explaining assumptions, parameter settings, and how to reproduce results  
@@ -33,8 +31,7 @@ Each folder corresponds to a specific simulation design or empirical case study 
 
 ## 🔧 Technical Environment & Requirements  
 - R (version ≧ 4.0)  
-- Key R packages: `HonestDiD`, `fixest`, `CVXR`, `tidyverse`, `ggplot2`, `data.table`  
-- (Optional) LaTeX / Overleaf for generating tables/figures for the thesis report  
+- Key R packages: `HonestDiD`, `fixest`, `CVXR`, `tidyverse`, `ggplot2`, `data.table`   
 - GitHub (for version control) and the repository is structured for reproducibility  
 
 ## 🚀 How to Use / Reproduce  
@@ -49,7 +46,7 @@ Run the script: it will generate simulation data, estimate ATT under varying con
 
 Review the output files (tables/graphics) for interpretations of bias, bound width, and robustness trade-offs.
 
-📌 Key Findings (to be updated)
+📌 Key Findings 
 In canonical DiD designs, estimator bias under parallel trends is minimal; however, once pre-trends or group-specific trends violate the assumption, bias grows quickly.
 
 Applying RM bounds via HonestDiD helps quantify the identification risk and provides a narrower credible region for ATT.
@@ -65,16 +62,10 @@ License: MIT License (see LICENSE file).
 ✉️ Contact
 For questions, suggestions, or collaborations, feel free to contact me:
 
-Email: [your-email@example.com]
+Email: kaganeskicioglu@gmail.com
 
 GitHub profile: https://github.com/endarfit
 
 Thank you for visiting the repository — I hope this code base supports your work in robust causal inference and policy evaluation!
 
-yaml
-Kodu kopyala
-
 ---
-
-If you like, I can **generate a formatted PDF version** of this README or create a **badge and topics list** for your GitHub repo (e.g., “econometrics”, “difference-in-differences”, “causal-inference”, “R”). Would you like me to do that?
-::contentReference[oaicite:3]{index=3}
